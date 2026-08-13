@@ -1,0 +1,29 @@
+# Byte-compiled / cache
+__pycache__/
+*.pyc
+*.pyo
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Transient gating-candidate checkpoints (TrainingManager.py writes these
+# under Networks/ mid-episode and always deletes them afterward - see
+# _candidate_tmp.keras / _gating_candidate.keras - but ignore them anyway
+# in case a run gets killed mid-gating and leaves one behind).
+Networks/_candidate_tmp.keras
+Networks/_gating_candidate.keras
+
+# Large, regenerable self-play artifacts from past runs. These sit outside
+# the paths the code actually reads/writes (Networks/, TrainingExamples/ -
+# see CLAUDE.md/ARCHITECTURE_OVERVIEW.md), and individual files here run
+# into the hundreds of MB - past GitHub's 100MB per-file limit, so they
+# couldn't be pushed as plain git objects even if tracked.
+self_play_Networks/
+self_play_TrainingExamples/
+PretrainExamples/
+
+# Network.keras (current champion), Networks/ (promoted checkpoints), and
+# TrainingExamples/ (replay buffer) are intentionally NOT ignored - these
+# are what Project.py resumes from, so they need to travel to the Windows
+# desktop for training to continue rather than restart.

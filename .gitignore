@@ -7,23 +7,26 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# Transient gating-candidate checkpoints (TrainingManager.py writes these
-# under Networks/ mid-episode and always deletes them afterward - see
-# _candidate_tmp.keras / _gating_candidate.keras - but ignore them anyway
-# in case a run gets killed mid-gating and leaves one behind).
-Networks/_candidate_tmp.keras
-Networks/_gating_candidate.keras
+# All generated artifacts live under data/. The resume-critical files are tracked
+# (see the "NOT ignored" note below); everything heavy/regenerable is ignored.
 
-# Large, regenerable self-play artifacts from past runs. These sit outside
-# the paths the code actually reads/writes (Networks/, TrainingExamples/ -
-# see CLAUDE.md/ARCHITECTURE_OVERVIEW.md), and individual files here run
-# into the hundreds of MB - past GitHub's 100MB per-file limit, so they
-# couldn't be pushed as plain git objects even if tracked.
+# Transient gating-candidate checkpoints (training/manager.py writes these under
+# data/Networks mid-episode - _candidate_tmp.keras / _gating_candidate.keras - and
+# always deletes them afterward, but ignore them in case a run gets killed mid-gating).
+data/Networks/_candidate_tmp.keras
+data/Networks/_gating_candidate.keras
+
+# Large raw-MCTS example pool. Regenerable via `python pretrain.py`, so not tracked.
+data/PretrainExamples/
+
+# Large, regenerable self-play artifacts from past runs. These sit at the repo root,
+# outside data/, and nothing in the active code reads them (see CLAUDE.md/
+# ARCHITECTURE_OVERVIEW.md); individual files run into the hundreds of MB - past
+# GitHub's 100MB per-file limit - so they are never tracked.
 self_play_Networks/
 self_play_TrainingExamples/
-PretrainExamples/
 
-# Network.keras (current champion), Networks/ (promoted checkpoints), and
-# TrainingExamples/ (replay buffer) are intentionally NOT ignored - these
-# are what Project.py resumes from, so they need to travel to the Windows
-# desktop for training to continue rather than restart.
+# NOT ignored: data/Network.keras (current champion), data/Networks/ (promoted
+# checkpoints), and data/TrainingExamples/ (replay buffer) are what project.py /
+# pretrain.py resume from, so they need to travel to the Windows desktop for training
+# to continue rather than restart.

@@ -1,17 +1,27 @@
-import tensorflow as tf
-
 from uttt.player.agent import ProbabilisticNetworkMCTSAgent, agent_match
-from uttt.worker import configure_cpu_worker
+from uttt.worker import seed_worker_rng
+from uttt.inference.server import InferenceClient
+
+# Set once per worker process by init_gating_worker (a multiprocessing.Pool
+# initializer) - see uttt/simulation/self_play.py's identical _request_queue for why
+# these can't be passed as simulate_gating_games() arguments instead.
+_candidate_queue = None
+_champion_queue = None
 
 
-def simulate_gating_games(candidate_path, champion_path, num_games, start_index, progress_queue=None):
-    configure_cpu_worker()
+def init_gating_worker(candidate_queue, champion_queue):
+    global _candidate_queue, _champion_queue
+    _candidate_queue = candidate_queue
+    _champion_queue = champion_queue
+    seed_worker_rng()
 
-    # compile=False: gating never calls fit(), so building the optimizer/loss
-    # graph on load is pure waste - and this worker loads two full models
-    # (candidate + champion) instead of self-play's one.
-    candidate_network = tf.keras.models.load_model(candidate_path, compile=False)
-    champion_network = tf.keras.models.load_model(champion_path, compile=False)
+
+def simulate_gating_games(num_games, start_index, progress_queue=None):
+    # Candidate and champion are different weights, served by two separate
+    # inference-server processes (see TrainingManager.run_gating) - one InferenceClient
+    # per queue routes each side's requests to the right one.
+    candidate_network = InferenceClient(_candidate_queue)
+    champion_network = InferenceClient(_champion_queue)
 
     candidate_agent = ProbabilisticNetworkMCTSAgent(candidate_network)
     champion_agent = ProbabilisticNetworkMCTSAgent(champion_network)

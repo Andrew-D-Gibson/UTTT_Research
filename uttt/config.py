@@ -3,7 +3,7 @@ config = {
     # data/logs/config_history/config_v{version}.json and stamped on every training_log.csv/
     # gating_log.csv row, so a given episode's exact hyperparameters can always be
     # recovered later, even if config.py has since moved on (see uttt/run_logging.py).
-    'version': 1,
+    'version': 2,
 
     'network': {
         'architecture': 'hierarchicalResNet',   # 'hierarchicalResNet' or 'convNet' - see uttt/network/architectures.py's build_network()
@@ -16,9 +16,21 @@ config = {
         'dirichlet_epsilon': 0.25,    # weight of noise vs. network prior at the root
     },
 
+    'inference': {
+        'gpu_ids': [],          # e.g. [0, 1] for a 2-GPU box - one inference server process
+                                 # per id, all self-play workers share them. [] -> a single
+                                 # CPU-only inference server (safe default, matches old behavior).
+        'max_batch_size': 64,   # cap on boards per network() call in the inference server
+        'max_wait_ms': 5,       # longest a server waits to fill a batch before flushing partial
+    },
+
     'self_play': {
-        'num_of_processes': 12,                     
-        'num_of_self_play_games_per_process': 40,  
+        # Workers no longer load a network or import TensorFlow (see uttt/inference/server.py),
+        # so this can go well past physical core count on a box with a real GPU behind it -
+        # more concurrent workers means more simultaneous in-flight inference requests, which
+        # is what actually grows batch sizes. Tune alongside 'inference' above once profiled.
+        'num_of_processes': 12,
+        'num_of_self_play_games_per_process': 40,
         'num_of_testing_games': 60,       # 240? candidate vs. champion gating match total, parallelized across num_of_processes
         'promotion_win_rate': 0.55,       # candidate must win >= this share of decisive (non-drawn) gating games to be promoted
         'temperature_moves': 20,       # sample proportional to visit counts for this many plies, then play greedy

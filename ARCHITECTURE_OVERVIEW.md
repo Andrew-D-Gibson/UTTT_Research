@@ -48,10 +48,15 @@ across episodes within one run:
 ```
 project.py / TrainingManager.train()
   │
-  ├─ mp.Pool(num_of_processes): simulate_self_play_games() per worker, playing
-  │  against the current champion (whatever data/Network.keras currently holds)
-  │     (each worker loads data/Network.keras, seeds its own RNG from os.getpid(),
-  │      caps itself to 1 TF thread to avoid oversubscription across workers)
+  ├─ start_inference_servers(): one run_inference_server process per config.inference.gpu_id,
+  │  each loading its own copy of data/Network.keras and batching leaf-evaluation requests
+  │  from all self-play workers (uttt/inference/server.py) - see §4a.
+  │
+  ├─ mp.Pool(num_of_processes, initializer=init_self_play_worker, initargs=(request_queue,)):
+  │  simulate_self_play_games() per worker, playing against the current champion
+  │     (workers never load a network or import TensorFlow themselves - each just seeds
+  │      its own RNG from os.getpid() and holds an InferenceClient that submits leaf
+  │      boards to request_queue and blocks for a batched response)
   │     └─ per game: MCTS.search(add_root_noise=True) → sample move
   │                  (∝ visit counts for the first temperature_moves plies,
   │                   greedy/argmax after) → TrainingExample
@@ -126,11 +131,12 @@ evaluating leaves:
 - **Temperature annealing.** `simulate_self_play_games()` samples moves proportional to visit
   counts (`p=mcts.pi`) for the first `temperature_moves` plies of a game, then plays greedily
   (`argmax`) afterward.
-- **Per-worker RNG seeding + thread caps.** Each self-play worker process seeds `random`/`numpy`
-  from its own PID and caps itself to a single TF thread
-  (`set_intra_op_parallelism_threads(1)`/`set_inter_op_parallelism_threads(1)`), so
-  `num_of_processes` workers running concurrently don't each spin up a full per-core thread pool
-  and oversubscribe the CPU.
+- **Per-worker RNG seeding.** Each self-play worker process seeds `random`/`numpy` from its own PID
+  (`uttt/worker.py`'s `seed_worker_rng()`) so parallel games don't end up correlated. Workers no
+  longer import TensorFlow at all (see §4a), so there's no per-process TF thread pool to cap
+  anymore - `configure_cpu_worker()`'s thread-capping half only still runs inside
+  `run_inference_server` and `uttt/simulation/tournament.py`'s worker init (a separate,
+  not-batched tool - see §6).
 - **Consolidated self-play progress.** Workers report per-game completions through a shared
   `multiprocessing.Manager().Queue()` (built once in `TrainingManager.__init__`, reused every
   episode) instead of each process writing to stdout independently; `TrainingManager.run_self_play()`
@@ -138,12 +144,54 @@ evaluating leaves:
   (one line/epoch) rather than silent, and `PlayerAgent.agent_match()` prints one line per game with
   a running tally and ETA — all three exist so a long-running phase never looks hung.
 
+### 4a. Batched inference across workers (`uttt/inference/server.py`)
+
+Self-play/gating workers no longer load a network themselves. Each holds an `InferenceClient`
+that implements the same `__call__(board_arrays, training=False)` interface `MCTS.check_network`
+already calls, so `MCTS`'s tree-walk logic is completely unaware whether it's talking to a real
+in-process Keras model (as `uttt/interface.py` and `network_tournament.py` still use directly) or
+this stand-in:
+
+```
+worker (InferenceClient)                     inference server (run_inference_server)
+  __call__(board) ─┐                           owns the one loaded network for this GPU
+                    ├─ put (board, response_conn) on a shared request_queue
+                    └─ blocks on response_conn.recv() ──┐
+                                                          ├─ drains request_queue up to
+                                                          │  inference.max_batch_size boards or
+                                                          │  inference.max_wait_ms, whichever first
+                                                          ├─ one network(stacked_boards) call
+                                                          └─ sends each result back down its
+                                                             requester's own response_conn
+```
+
+Batching comes from many *different* games' leaf requests landing at the server around the same
+time (purely because many worker processes are mid-search simultaneously) - MCTS's own recursive
+search (`MCTS_iteration`) is untouched, still fully synchronous per game, no virtual loss. One
+server process per `config['inference']['gpu_ids']` entry (`[]` → a single CPU-only server).
+`TrainingManager.start_inference_server(s)`/`stop_inference_servers()` own the server processes'
+lifecycle, one set per `run_self_play()`/`run_gating()` call (`run_gating` runs two - candidate and
+champion are different weights, so each needs its own server rather than sharing one).
+
+The request queue is passed to `Pool` workers via `initializer`/`initargs`
+(`init_self_play_worker`/`init_gating_worker`), not as a normal `apply_async` argument - a raw
+`multiprocessing.Queue` can only be inherited by a worker at process-creation time; pickling one
+through `Pool`'s per-task dispatch queue raises `RuntimeError: Queue objects should only be shared
+between processes through inheritance`. This is the same reason `uttt/simulation/tournament.py`
+already builds its agents via a `Pool(initializer=...)` rather than per-call arguments.
+
 ## 5. Config knobs (`uttt/config.py`)
 
 - `mcts.exploration_parameter` — PUCT exploration constant.
 - `mcts.search_depth` — MCTS iterations per move.
 - `mcts.dirichlet_alpha` / `mcts.dirichlet_epsilon` — root noise shape/weight during self-play (§4).
-- `self_play.num_of_processes` — parallel self-play worker processes per episode.
+- `inference.gpu_ids` — one inference server process per id (`[]` → single CPU-only server); §4a.
+- `inference.max_batch_size` / `inference.max_wait_ms` — batching policy for each inference server
+  (§4a): boards per `network()` call, and how long to wait to fill a batch before flushing partial.
+- `self_play.num_of_processes` — parallel self-play worker processes per episode. No longer bounded
+  by physical core count the way it used to be (workers don't load a network or import TensorFlow
+  anymore), and is also the main lever for inference batch size - more concurrent workers means
+  more simultaneous in-flight requests hitting each server.
 - `self_play.num_of_self_play_games_per_process` — games each worker plays before returning.
 - `self_play.num_of_testing_games` — games per champion-vs-candidate gating match each episode (§2).
 - `self_play.promotion_win_rate` — minimum share of decisive gating games the candidate must win to
@@ -161,8 +209,11 @@ evaluating leaves:
 
 - **No symmetry data augmentation.** UTTT has 8 dihedral board symmetries; training data isn't
   multiplied using them, which is otherwise a cheap way to get more mileage out of self-play data.
-- **No batched leaf evaluation (virtual loss).** Each MCTS leaf still costs one model call; real
-  AlphaZero implementations batch several pending leaf evaluations into one forward pass.
+- **No in-tree virtual loss.** Leaf evaluations are now batched *across* concurrently-running
+  self-play/gating games (§4a), but a single MCTS search still evaluates one leaf, fully
+  backpropagates, then starts the next iteration - it never has multiple leaves "pending" within
+  the same tree the way virtual-loss AlphaZero implementations do. Batch size is therefore capped
+  by how many games happen to be mid-search at once, not by search depth.
 - **`uttt/evaluation/network_tournament.py`** is a standalone analysis tool, not wired into the
   training loop.
 

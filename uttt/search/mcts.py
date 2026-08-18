@@ -91,8 +91,11 @@ class MCTS():
         board_arrays = np.array([board.get_array_representation()])
 
         outputs = self.network(board_arrays, training=False)
-        search_probs = outputs['policy_output'].numpy()
-        value_est = outputs['value_output'].numpy()
+        # np.asarray rather than .numpy(): outputs may be a real EagerTensor (in-process
+        # network) or a plain numpy array (InferenceClient, uttt/inference/server.py) -
+        # this works with either without MCTS needing to know which it's talking to.
+        search_probs = np.asarray(outputs['policy_output'])
+        value_est = np.asarray(outputs['value_output'])
 
         legal_logits = np.squeeze(search_probs)[board.find_moves()]  # Get only the logits for valid moves
         # Softmax over legal moves only (masking then softmaxing full-board logits

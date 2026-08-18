@@ -43,13 +43,24 @@ patterns that span multiple files and are easy to miss from reading any single f
   `uttt/training/manager.py`, `uttt/simulation/self_play.py`, `uttt/player/agent.py`, ...). There's
   no per-module configuration — changing search depth, process count, or training schedule always
   means editing `uttt/config.py`.
-- **The self-play worker boundary is a full network reload, not shared memory.** `TrainingManager`
-  spins up a `multiprocessing.Pool`, and each worker (`uttt/simulation/self_play.py`) independently
-  loads `data/Network.keras` from disk and runs MCTS entirely on CPU (`CUDA_VISIBLE_DEVICES=-1`) with
-  its own single-threaded TF config. Changes to how the network is saved/loaded (e.g. checkpoint
-  file extension, format) affect both `uttt/training/manager.py` (the writer) and
-  `uttt/simulation/self_play.py`/`uttt/player/agent.py` (the readers) — Keras 3 requires an explicit
-  `.keras`/`.h5` extension on every save path.
+- **Self-play/gating workers don't hold a network at all — inference is batched through a separate
+  server process.** `TrainingManager.start_inference_server(s)` spins up one `run_inference_server`
+  process per `config['inference']['gpu_ids']` entry (`uttt/inference/server.py`), each loading its
+  own copy of the network and owning a `multiprocessing.Queue` that self-play/gating workers submit
+  leaf-board requests to; the server batches whatever's arrived (up to `max_batch_size` boards or
+  `max_wait_ms`, whichever first) into one `network()` call and routes each result back down the
+  requester's own `Pipe`. Workers never import TensorFlow — each just holds an `InferenceClient`
+  (same `__call__(board_arrays, training=False)` interface as a real model, so `MCTS.check_network`
+  can't tell them apart). The request queue must be handed to `Pool` workers via
+  `initializer`/`initargs` (`init_self_play_worker`/`init_gating_worker`), not a normal
+  `apply_async` argument — a raw `Queue` can only be inherited at process-creation time, not pickled
+  through `Pool`'s per-task dispatch queue. `run_gating` runs two separate servers (candidate and
+  champion are different weights). See `ARCHITECTURE_OVERVIEW.md` §4a for the full design. Changes
+  to how the network is saved/loaded (e.g. checkpoint file extension, format) affect
+  `uttt/training/manager.py` (the writer), `uttt/inference/server.py` (the only reader during
+  self-play/gating), and `uttt/player/agent.py`/`uttt/interface.py` (which still load a network
+  in-process for single interactive/evaluation games) — Keras 3 requires an explicit `.keras`/`.h5`
+  extension on every save path.
 - **`MCTS` nodes don't own their own board.** Only the root of an `MCTS` tree holds a real
   `UTTTBoard`; every recursive call during search (`MCTS_iteration`, `random_rollout`,
   `check_network`, `make_children_list`) takes that single shared board as an explicit parameter

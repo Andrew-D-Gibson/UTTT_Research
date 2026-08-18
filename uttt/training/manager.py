@@ -12,8 +12,9 @@ from datetime import datetime
 
 # Function imports
 from uttt.board.symmetry import apply_board_symmetry, apply_move_vector_symmetry, NUM_SYMMETRIES
-from uttt.simulation.self_play import simulate_self_play_games
-from uttt.simulation.gating import simulate_gating_games
+from uttt.simulation.self_play import simulate_self_play_games, init_self_play_worker
+from uttt.simulation.gating import simulate_gating_games, init_gating_worker
+from uttt.inference.server import run_inference_server
 
 from uttt.config import config
 from uttt.paths import (
@@ -55,11 +56,14 @@ class TrainingManager:
         # Force 'spawn' regardless of platform default: on Linux, mp.Pool()'s default
         # 'fork' start method clones the parent's already-initialized TensorFlow state
         # (the champion network is loaded before any Pool is created), and TF raises
-        # "Intra op parallelism cannot be modified after initialization" when
-        # configure_cpu_worker() then tries to set thread counts in the forked child.
-        # 'spawn' starts each worker as a clean interpreter so TF is uninitialized
-        # until configure_cpu_worker() runs. macOS already defaults to 'spawn', which
-        # is why this only surfaces on Linux.
+        # "Intra op parallelism cannot be modified after initialization" if a forked
+        # child then tries to set thread counts (self-play/gating workers no longer do
+        # this - see uttt/worker.py's seed_worker_rng() - but the inference server
+        # processes still do, via os.environ['CUDA_VISIBLE_DEVICES'] in
+        # run_inference_server, uttt/inference/server.py, which must also happen
+        # before TF initializes in that process). 'spawn' starts each worker/server as
+        # a clean interpreter so TF is uninitialized until that code runs. macOS
+        # already defaults to 'spawn', which is why this only surfaces on Linux.
         self.mp_ctx = mp.get_context('spawn')
 
         # Long-lived so every episode can hand out a fresh Queue from it without
@@ -215,6 +219,51 @@ class TrainingManager:
               f"buffer_cap={config['training']['max_training_examples']}")
         print(f"  episodes:  {config['training']['num_of_episodes']}")
 
+    def start_inference_server(self, network_path, gpu_id):
+        # One request queue + one dedicated process owning one loaded copy of
+        # `network_path`, pinned to `gpu_id` (uttt/inference/server.py). Plain
+        # mp_ctx.Queue(), not self.mp_manager.Queue() - this queue is on the hot path
+        # (hit once per MCTS leaf, ~512 times per move per worker), and routing that
+        # through the SyncManager's proxy process (as progress_queue does, fine for
+        # its much lower message rate) would add a lot of avoidable overhead. Plain
+        # Queue also reliably carries the Connection objects InferenceClient passes
+        # through it, which a Manager-proxied queue isn't guaranteed to preserve.
+        request_queue = self.mp_ctx.Queue()
+        server = self.mp_ctx.Process(
+            target=run_inference_server,
+            args=(network_path, request_queue, gpu_id,
+                  config['inference']['max_batch_size'],
+                  config['inference']['max_wait_ms'] / 1000.0),
+        )
+        server.start()
+        return request_queue, server
+
+    def start_inference_servers(self, network_path):
+        # One server per configured GPU, all serving the same network - self-play
+        # workers share this single request_queue and whichever server drains a given
+        # request handles it. [] -> a single CPU-only server (gpu_id=None).
+        gpu_ids = config['inference']['gpu_ids'] or [None]
+        request_queue = self.mp_ctx.Queue()
+        servers = []
+        for gpu_id in gpu_ids:
+            server = self.mp_ctx.Process(
+                target=run_inference_server,
+                args=(network_path, request_queue, gpu_id,
+                      config['inference']['max_batch_size'],
+                      config['inference']['max_wait_ms'] / 1000.0),
+            )
+            server.start()
+            servers.append(server)
+        return request_queue, servers
+
+    def stop_inference_servers(self, request_queue, servers):
+        # One None sentinel per server - each server exits after consuming exactly
+        # one (see run_inference_server's `if item is None: break`).
+        for _ in servers:
+            request_queue.put(None)
+        for server in servers:
+            server.join()
+
     def run_self_play(self):
         num_processes = config['self_play']['num_of_processes']
         games_per_process = config['self_play']['num_of_self_play_games_per_process']
@@ -224,8 +273,14 @@ class TrainingManager:
         self_play_start_time = time.time()
 
         progress_queue = self.mp_manager.Queue()
+        request_queue, servers = self.start_inference_servers(NETWORK_PATH)
 
-        pool = self.mp_ctx.Pool(num_processes)
+        # request_queue must go through Pool's initializer/initargs, not apply_async's
+        # per-task args - a raw multiprocessing.Queue can only be inherited at worker
+        # process creation, not pickled through Pool's task-dispatch queue at call time
+        # (see uttt/simulation/self_play.py's init_self_play_worker).
+        pool = self.mp_ctx.Pool(num_processes, initializer=init_self_play_worker,
+                                 initargs=(request_queue,))
         async_results = [
             pool.apply_async(simulate_self_play_games, args=(progress_queue,))
             for _ in range(num_processes)
@@ -253,6 +308,7 @@ class TrainingManager:
                   f'({plies} plies, {duration:.1f}s) - elapsed {elapsed:.0f}s, ETA ~{eta:.0f}s')
 
         pool.join()
+        self.stop_inference_servers(request_queue, servers)
 
         # .get() (not the old callback=) so a worker exception is re-raised here instead of
         # silently under-filling the replay buffer this episode was supposed to receive.
@@ -304,10 +360,21 @@ class TrainingManager:
 
             progress_queue = self.mp_manager.Queue()
 
-            pool = self.mp_ctx.Pool(len(chunk_sizes))
+            # Candidate and champion are different weights, so they need two separate
+            # inference servers rather than sharing one - split across the configured
+            # GPUs (candidate on the first, champion on the second) so gating actually
+            # keeps both GPUs busy; both fall back to the same id/CPU if only one is
+            # configured.
+            gpu_ids = config['inference']['gpu_ids'] or [None]
+            candidate_gpu = gpu_ids[0]
+            champion_gpu = gpu_ids[1] if len(gpu_ids) > 1 else gpu_ids[0]
+            candidate_queue, candidate_server = self.start_inference_server(candidate_path, candidate_gpu)
+            champion_queue, champion_server = self.start_inference_server(NETWORK_PATH, champion_gpu)
+
+            pool = self.mp_ctx.Pool(len(chunk_sizes), initializer=init_gating_worker,
+                                     initargs=(candidate_queue, champion_queue))
             async_results = [
-                pool.apply_async(simulate_gating_games,
-                                  args=(candidate_path, NETWORK_PATH, size, start_index, progress_queue))
+                pool.apply_async(simulate_gating_games, args=(size, start_index, progress_queue))
                 for size, start_index in zip(chunk_sizes, start_indices)
             ]
             pool.close()
@@ -334,6 +401,8 @@ class TrainingManager:
                       f'({outcome}, {duration:.1f}s) - elapsed {elapsed:.0f}s, ETA ~{eta:.0f}s')
 
             pool.join()
+            self.stop_inference_servers(candidate_queue, [candidate_server])
+            self.stop_inference_servers(champion_queue, [champion_server])
 
             # .get() (not a callback) so a worker exception is re-raised here
             # instead of silently under-counting the tally that decides promotion.

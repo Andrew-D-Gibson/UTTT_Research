@@ -19,3 +19,12 @@ def configure_cpu_worker():
     # (matters if multiprocessing's start method is ever 'fork' instead of 'spawn').
     random.seed(os.getpid())
     np.random.seed(os.getpid())
+
+
+def seed_worker_rng():
+    # Same RNG-seeding half as configure_cpu_worker(), for workers that talk to a
+    # remote InferenceClient (uttt/inference/server.py) instead of loading their own
+    # network - those workers never import TensorFlow, so there's no GPU to hide and
+    # no per-process TF thread pool to cap.
+    random.seed(os.getpid())
+    np.random.seed(os.getpid())

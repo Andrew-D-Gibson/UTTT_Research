@@ -1,22 +1,33 @@
 import os
 import time
 import numpy as np
-import tensorflow as tf
 
 from uttt.search.mcts import MCTS
 from uttt.training.example import TrainingExample
-from uttt.worker import configure_cpu_worker
-from uttt.paths import NETWORK_PATH
+from uttt.worker import seed_worker_rng
+from uttt.inference.server import InferenceClient
 
 from uttt.config import config
+
+# Set once per worker process by init_self_play_worker (a multiprocessing.Pool
+# initializer), not passed as a per-call argument - a raw multiprocessing.Queue can
+# only be handed to a worker at process-creation time (Pool's initargs), not pickled
+# through Pool's per-task dispatch queue (apply_async args), which raises
+# "Queue objects should only be shared between processes through inheritance".
+# Mirrors uttt/simulation/tournament.py's _agents/init_tournament_worker pattern.
+_request_queue = None
+
+
+def init_self_play_worker(request_queue):
+    global _request_queue
+    _request_queue = request_queue
+    seed_worker_rng()
 
 
 def simulate_self_play_games(progress_queue=None):
     training_examples = []
 
-    configure_cpu_worker()
-
-    network = tf.keras.models.load_model(NETWORK_PATH, compile=False)
+    network = InferenceClient(_request_queue)
     mcts = MCTS(network = network)
 
     num_games = config['self_play']['num_of_self_play_games_per_process']

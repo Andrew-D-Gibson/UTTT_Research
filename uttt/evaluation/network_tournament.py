@@ -151,10 +151,15 @@ def run_tournament(agent_specs, iterations, num_processes, log_path=TOURNAMENT_L
     print(f'\n--- Tournament: {iterations} games ({num_processes} processes) ---')
     start_time = time.time()
 
-    mp_manager = mp.Manager()
+    # Force 'spawn' regardless of platform default: see the matching comment in
+    # uttt/training/manager.py - the default 'fork' start method on Linux clones
+    # already-initialized TensorFlow state into workers, which breaks
+    # configure_cpu_worker()'s thread-count calls.
+    mp_ctx = mp.get_context('spawn')
+    mp_manager = mp_ctx.Manager()
     progress_queue = mp_manager.Queue()
 
-    pool = mp.Pool(num_processes, initializer=init_tournament_worker, initargs=(agent_specs,))
+    pool = mp_ctx.Pool(num_processes, initializer=init_tournament_worker, initargs=(agent_specs,))
     for game_index in range(iterations):
         i, j = (int(x) for x in np.random.choice(len(ratings), size=2, replace=False))
         pool.apply_async(play_tournament_game, args=(i, j, game_index, progress_queue))

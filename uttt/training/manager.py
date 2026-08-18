@@ -52,9 +52,19 @@ class TrainingManager:
             'episode_duration_s',
         ]
 
+        # Force 'spawn' regardless of platform default: on Linux, mp.Pool()'s default
+        # 'fork' start method clones the parent's already-initialized TensorFlow state
+        # (the champion network is loaded before any Pool is created), and TF raises
+        # "Intra op parallelism cannot be modified after initialization" when
+        # configure_cpu_worker() then tries to set thread counts in the forked child.
+        # 'spawn' starts each worker as a clean interpreter so TF is uninitialized
+        # until configure_cpu_worker() runs. macOS already defaults to 'spawn', which
+        # is why this only surfaces on Linux.
+        self.mp_ctx = mp.get_context('spawn')
+
         # Long-lived so every episode can hand out a fresh Queue from it without
         # spinning up a new manager subprocess each time.
-        self.mp_manager = mp.Manager()
+        self.mp_manager = self.mp_ctx.Manager()
 
         self.episodes_run = 0
         self.promotions = 0
@@ -215,7 +225,7 @@ class TrainingManager:
 
         progress_queue = self.mp_manager.Queue()
 
-        pool = mp.Pool(num_processes)
+        pool = self.mp_ctx.Pool(num_processes)
         async_results = [
             pool.apply_async(simulate_self_play_games, args=(progress_queue,))
             for _ in range(num_processes)
@@ -294,7 +304,7 @@ class TrainingManager:
 
             progress_queue = self.mp_manager.Queue()
 
-            pool = mp.Pool(len(chunk_sizes))
+            pool = self.mp_ctx.Pool(len(chunk_sizes))
             async_results = [
                 pool.apply_async(simulate_gating_games,
                                   args=(candidate_path, NETWORK_PATH, size, start_index, progress_queue))

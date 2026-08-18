@@ -1,7 +1,7 @@
 import tensorflow as tf
-from uttt.network.architectures import hierarchicalResNet, convNet
+from uttt.network.architectures import build_network
 
-model = hierarchicalResNet()
+model = build_network()  # architecture picked via config['network']['architecture']
 
 # Text summary (always works, no extra deps)
 model.summary(expand_nested=True, show_trainable=True)

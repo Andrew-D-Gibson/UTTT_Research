@@ -5,6 +5,10 @@ config = {
     # recovered later, even if config.py has since moved on (see uttt/run_logging.py).
     'version': 1,
 
+    'network': {
+        'architecture': 'hierarchicalResNet',   # 'hierarchicalResNet' or 'convNet' - see uttt/network/architectures.py's build_network()
+    },
+
     'mcts': {
         'exploration_parameter': 1.5,
         'search_depth': 512,           

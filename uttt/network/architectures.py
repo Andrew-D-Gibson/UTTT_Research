@@ -3,8 +3,6 @@ import tensorflow as tf
 
 from uttt.board.symmetry import MOVE_TO_ARRAY_FLAT_INDEX
 
-## BROKEN IN THE CURRENT IMPLEMENTATION
-## THIS OUTPUTS A SOFTMAX ALREADY, BUT WE CALCULATE IT LATER AFTER REMOVING ILLEGAL MOVES RIGHT NOW
 def convNet():
     ultimate_tic_tac_toe_input = tf.keras.layers.Input(shape=(9,9,4), name='uttt_input')
 
@@ -18,21 +16,27 @@ def convNet():
     dense_1 = tf.keras.layers.Dense(512, activation='relu', name='dense_1')(flatten)
     dense_2 = tf.keras.layers.Dense(256, activation='relu', name='dense_2')(dense_1)
 
-    policy_output = tf.keras.layers.Dense(81, activation='softmax', name='policy_output')(dense_2)
+    # Raw logits, not softmax: masking illegal moves + softmax happens outside the
+    # model, at MCTS/inference time (see uttt/search/mcts.py's check_network), which
+    # indexes this output as legal_logits and softmaxes only over legal moves. A
+    # softmax activation here would double-softmax (once over all 81 moves here,
+    # again over the legal subset there), which isn't a valid probability
+    # distribution over legal moves.
+    policy_output = tf.keras.layers.Dense(81, name='policy_output')(dense_2)
     value_output = tf.keras.layers.Dense(1, activation='tanh', name='value_output')(dense_2)
 
     model = tf.keras.models.Model(inputs=ultimate_tic_tac_toe_input, outputs=[policy_output, value_output], name='convNet')
 
     # Compile model
     losses = {
-        'policy_output': 'categorical_crossentropy',
+        'policy_output': tf.keras.losses.CategoricalCrossentropy(from_logits=True),
         'value_output': 'mse'
     }
 
     # 'accuracy' only makes sense for the softmax policy head; the tanh-activated
     # scalar value head would be scored as an (essentially meaningless) exact-match
     # check on a continuous value, so it's only requested for policy_output here.
-    model.compile(optimizer='Adam', loss=losses, metrics={'policy_output': 'accuracy'})
+    model.compile(optimizer='Adam', loss=losses, metrics={'policy_output': tf.keras.metrics.CategoricalAccuracy(name='accuracy')})
     return model
 
 
@@ -213,3 +217,24 @@ def hierarchicalResNet():
     }
     model.compile(optimizer='Adam', loss=losses, metrics=metrics)
     return model
+
+
+# Registry used by build_network() to hot-swap architectures via config.py's
+# config['network']['architecture'] instead of editing launcher code.
+ARCHITECTURES = {
+    'convNet': convNet,
+    'hierarchicalResNet': hierarchicalResNet,
+}
+
+
+def build_network(name=None):
+    # name defaults to config['network']['architecture'] so every fresh-build call
+    # site (currently just project.py) picks up the config switch without each one
+    # importing uttt.config itself.
+    if name is None:
+        from uttt.config import config
+        name = config['network']['architecture']
+    try:
+        return ARCHITECTURES[name]()
+    except KeyError:
+        raise ValueError(f"Unknown network architecture '{name}'. Valid options: {list(ARCHITECTURES)}")

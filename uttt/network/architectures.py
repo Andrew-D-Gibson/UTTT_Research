@@ -25,7 +25,15 @@ def convNet():
     policy_output = tf.keras.layers.Dense(81, name='policy_output')(dense_2)
     value_output = tf.keras.layers.Dense(1, activation='tanh', name='value_output')(dense_2)
 
-    model = tf.keras.models.Model(inputs=ultimate_tic_tac_toe_input, outputs=[policy_output, value_output], name='convNet')
+    # Dict outputs (not a list) so calling the model returns outputs['policy_output']/
+    # outputs['value_output'] - the calling contract every consumer (MCTS's
+    # check_network, agent.py, interface.py) relies on, and that hierarchicalResNet
+    # also uses.
+    model = tf.keras.models.Model(
+        inputs=ultimate_tic_tac_toe_input,
+        outputs={'policy_output': policy_output, 'value_output': value_output},
+        name='convNet',
+    )
 
     # Compile model
     losses = {

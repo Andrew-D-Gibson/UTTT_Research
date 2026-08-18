@@ -17,19 +17,15 @@ produces.
 | [uttt/config.py](uttt/config.py) | Single dict of hyperparameters (MCTS, self-play, training). Source of truth for all tunable knobs — see §5. |
 | [uttt/board/uttt_board.py](uttt/board/uttt_board.py) | The game engine: 9 sub-boards packed into 81-bit `x`/`o` bitboards, tracks which sub-boards are decided and which are legal to move into. Supports `make_move`/`unmake_move` (see §4) and produces the `(9,9,4)` tensor fed to the network via `get_array_representation()`. |
 | [uttt/search/mcts.py](uttt/search/mcts.py) | The search tree. A node = a board position (visit stats, not its own board copy — see §4). Supports both a network-free random rollout mode and a network-guided PUCT-style mode. |
-| [uttt/player/agent.py](uttt/player/agent.py) | Wraps an `MCTS` (or raw network, or pure random) behind a common `get_move`/`make_move` interface; also has the head-to-head game/match runner used for evaluation (`agent_game`, `agent_match`, `test_network_vs_mcts`, `test_raw_network_vs_random`). |
+| [uttt/player/agent.py](uttt/player/agent.py) | Wraps an `MCTS` (or pure random) behind a common `get_move`/`make_move` interface; also has the head-to-head game/match runner used for evaluation (`agent_game`, `agent_match`). |
 | [uttt/training/example.py](uttt/training/example.py) | Converts a board + MCTS visit-count policy into a training tensor triple `(board_array, search_probs, reward)`. |
 | [uttt/simulation/self_play.py](uttt/simulation/self_play.py) | Plays full self-play games with the current network, producing `TrainingExample`s. This is the function farmed out to worker processes by `TrainingManager`. |
-| [uttt/simulation/raw_mcts.py](uttt/simulation/raw_mcts.py) | Network-free counterpart to `uttt/simulation/self_play.py`: plays full games with `MCTS(network=None)` (random-rollout evaluation, uniform priors) at `config['mcts']['pretrain_mcts_depth']`, producing the same `TrainingExample`s. Never imports TensorFlow. Farmed out to worker processes by `uttt/training/generate_raw_pool.py`. |
 | [uttt/training/manager.py](uttt/training/manager.py) | The outer loop: on construction, resumes the replay buffer from `data/TrainingExamples/` if anything's there (see §2 "Starting/resuming a run"); then per episode, self-plays with the current champion, trains a *candidate* cloned from the champion, gates the candidate against the champion head-to-head and only promotes/checkpoints it if it clears a win-rate margin (§2 data flow, §4), evaluates against baselines, logs metrics to `data/logs/training_log.csv`/`data/logs/gating_log.csv`. |
-| [uttt/training/generate_raw_pool.py](uttt/training/generate_raw_pool.py) | Standalone (and `pretrain.py`-callable) pool builder: `generate_pool()` parallelizes `uttt/simulation/raw_mcts.py` across `mp.Pool(num_of_processes)`, saving incrementally to `data/PretrainExamples/pool.pkl` until it reaches `training.max_training_examples` examples. Idempotent - a no-op once the pool already meets target, so it's safe to call unconditionally on every `pretrain.py` run. |
-| [uttt/training/pretrain_manager.py](uttt/training/pretrain_manager.py) | Raw-MCTS bootstrap counterpart to `TrainingManager`: loads the pool `uttt/training/generate_raw_pool.py` built and, per round, samples `training_sample_size` examples and trains `data/Network.keras` *in place* (no clone, no gating - see §2 pretraining data flow). Checkpoints every round to `data/Networks/Pretrain_N.keras`, logs to `data/logs/pretrain_log.csv`. |
-| [uttt/network/architectures.py](uttt/network/architectures.py) | Defines three candidate architectures (`denseNet`, `convNet`, `resNet`). Only `convNet()` is used by `project.py`/`pretrain.py`. |
-| [uttt/evaluation/elo.py](uttt/evaluation/elo.py) | Elo-rating engine (`ELOManager`): random-pairing calibration loop with progress/ETA printing. The root [elo.py](elo.py) launcher's `__main__` round-robins baseline agents (random / rollout-MCTS at various depths) sequentially, in-process. `uttt/evaluation/network_tournament.py` only reuses `ELOManager`'s `expected_result`/`delta_elo` static methods (its own tournament loop is parallelized separately, see below) — `ELOManager.calibrate()` itself is not wired into the main training loop. |
+| [uttt/network/architectures.py](uttt/network/architectures.py) | Defines the network architecture (`convNet`, policy+value heads) used by `project.py`. |
+| [uttt/evaluation/elo.py](uttt/evaluation/elo.py) | `ELOManager`: just the `expected_result`/`delta_elo` static Elo-math helpers, reused by `uttt/evaluation/network_tournament.py`'s tournament loop (which is parallelized separately, see below). |
 | [uttt/simulation/tournament.py](uttt/simulation/tournament.py) | Plays one tournament game between two agents built from lightweight specs (`{kind, name, path/depth}`). This is the function farmed out to worker processes by `run_tournament` in `uttt/evaluation/network_tournament.py`, mirroring `uttt/simulation/self_play.py`/`uttt/simulation/gating.py`: `init_tournament_worker` (a `Pool` initializer) loads every agent once per worker, not once per game. |
 | [uttt/evaluation/network_tournament.py](uttt/evaluation/network_tournament.py) | Standalone analysis tool: snapshots a subsampled ladder of `data/Networks/Episode_N.keras` checkpoints (so it never races a live training run's saves), builds specs for `ProbabilisticNetworkMCTSAgent`s from them plus network-free `RolloutMCTSAgent` baselines at several depths, and runs one combined Elo round-robin — parallelized across a `multiprocessing.Pool` the same way `TrainingManager` parallelizes self-play/gating (worker pool + a shared `Manager().Queue()` for progress; `run_tournament`'s main process is the only place Elo ratings are read or mutated, applying each update as results stream back in non-deterministic completion order). Writes ranked standings + an Elo-trajectory CSV to `data/logs/`. Answers "is the network better than plain search" as well as "which episode is best." Not wired into the training loop. Invoked via the root [network_tournament.py](network_tournament.py) launcher's `run_default()`. |
-| [project.py](project.py) | Entry point: build a fresh `convNet` and save it as `data/Network.keras` only if that file doesn't already exist (otherwise a restart resumes the existing champion instead of discarding it), then run `TrainingManager().train()`. This is the actively maintained entry point — `Project.ipynb` / `.ipynb_checkpoints` are stale and out of sync with it. |
-| [pretrain.py](pretrain.py) | Alternative, optional entry point that runs *before* `project.py`: same `convNet`-if-missing bootstrap, then unconditionally calls `generate_pool()` (from `uttt/training/generate_raw_pool.py`) followed by `PretrainManager().pretrain()` - one fire-and-forget command that builds/resumes the raw-MCTS pool and trains against it with no self-play or gating (§2 pretraining data flow). Meant as a one-time bootstrap before switching to `project.py`, not a standing replacement for it. |
+| [project.py](project.py) | Entry point: build a fresh `convNet` and save it as `data/Network.keras` only if that file doesn't already exist (otherwise a restart resumes the existing champion instead of discarding it), then run `TrainingManager().train()`. |
 
 ### Starting/resuming a run
 
@@ -39,16 +35,13 @@ across episodes within one run:
 - **Network**: `project.py` only builds+saves a fresh `convNet` if `data/Network.keras` doesn't
   already exist. If it does, `TrainingManager.__init__` loads it as the starting champion, so
   restarting the process resumes training rather than discarding it.
-- **Replay buffer**: `TrainingManager.load_latest_training_examples()` looks in
-  `data/TrainingExamples/` for the most-recently-modified file (not the highest `Episode_N` —
-  numbering restarts at 0 every run, so a stale file from an earlier run can have a higher N than
-  the real latest, the same footgun `uttt/evaluation/network_tournament.py` already accounts for
-  with `data/Networks/Episode_N.keras`), loads it as the starting buffer, renames it to a single
-  fixed backup name `data/TrainingExamples/_resumed_from.pkl`, and deletes every other file so
-  stale runs' episode files never coexist ambiguously with the new run's own numbering. Each saved
-  file already holds the *entire* buffer as of that episode (not just that episode's new examples —
-  see below), so the single most recent file already is essentially the full prior buffer; there's
-  nothing to merge across files.
+- **Replay buffer**: `TrainingManager.load_latest_training_examples()` loads the starting buffer
+  from one fixed-name file, `data/TrainingExamples/current_training_examples.pkl`, which always
+  holds the entire (post-trim) buffer as of the last episode that ran. `data/TrainingExamples/
+  Episode_N` files are a separate, permanent per-episode audit trail of just that episode's fresh
+  self-play examples (not the whole buffer, and not trimmed) — they're written every episode but
+  never read back on resume, so unlike `data/Networks/Episode_N.keras` their restart-at-0 numbering
+  across runs is harmless (nothing depends on `N` being globally increasing).
 
 ### Data flow, one training episode
 
@@ -68,12 +61,11 @@ project.py / TrainingManager.train()
   │
   ├─ clone_network(champion) → candidate; sample training_sample_size examples →
   │  one shuffled model.fit() on the candidate only (validation_split, EarlyStopping
-  │  on val_loss) — the champion itself is never mutated. Metrics logged to
-  │  data/logs/training_log.csv.
+  │  on val_loss) — the champion itself is never mutated.
   │
   ├─ gate: agent_match(candidate, champion, num_of_testing_games), both sides
   │  wrapped as ProbabilisticNetworkMCTSAgent (samples ∝ visit counts, so repeated
-  │  games actually differ - the deterministic NetworkMCTSAgent would replay the
+  │  games actually differ - a deterministic argmax agent would replay the
   │  same game every time in a fixed color order). Candidate must win at least
   │  self_play.promotion_win_rate (default 0.55) of decisive (non-drawn) games to
   │  be promoted - a bare wins > losses majority isn't enough, since with
@@ -84,45 +76,15 @@ project.py / TrainingManager.train()
   ├─ if promoted: candidate becomes the new champion → save data/Networks/Episode_N.keras
   │  and data/Network.keras. If rejected: no checkpoint is written this episode, so
   │  data/Networks/ ends up sparse (Episode_0, Episode_4, Episode_17, …) rather than dense.
-  ├─ test_network_vs_mcts() / test_raw_network_vs_random()   (printed only, against
-  │  whichever network data/Network.keras currently holds)
-  └─ pickle training_examples to data/TrainingExamples/Episode_N
-```
-
-### Data flow, raw-MCTS pretraining (optional, before self-play)
-
-```
-pretrain.py
   │
-  ├─ build convNet + save data/Network.keras, only if it doesn't already exist
+  ├─ pickle this episode's fresh examples to data/TrainingExamples/Episode_N (audit trail,
+  │  never trimmed/re-read) and the full trimmed buffer to
+  │  data/TrainingExamples/current_training_examples.pkl (what actually gets resumed from)
   │
-  ├─ generate_pool() [uttt/training/generate_raw_pool.py] - no-op if
-  │  data/PretrainExamples/pool.pkl already holds >= max_training_examples,
-  │  otherwise loops:
-  │     mp.Pool(num_of_processes): simulate_raw_mcts_games() per worker
-  │        (MCTS(network=None) - random rollout evaluation, uniform priors;
-  │         same temperature_moves schedule as self-play, no Dirichlet noise,
-  │         never touches TensorFlow) → save pool to disk after every batch
-  │  until the pool reaches max_training_examples, then trims to exactly that size
-  │
-  └─ PretrainManager.pretrain() - per round (training.num_of_episodes rounds):
-       sample training_sample_size examples from the (now-static) pool →
-       model.fit() on data/Network.keras directly - no clone_network(), no gating,
-       every round is kept unconditionally →
-       save data/Networks/Pretrain_N.keras and data/Network.keras →
-       log metrics to data/logs/pretrain_log.csv
+  └─ one row appended to data/logs/training_log.csv: self-play/training/episode durations,
+     self-play game/ply counts, buffer size, and the train_on_examples() metrics - stamped
+     with timestamp and config_version (see §7 "Auditability & logging" below)
 ```
-
-Unlike self-play, the pool is generated once and reused across all rounds - it's not
-regenerated per round, and nothing in this pipeline gates a round against a prior one.
-This is meant as a one-time bootstrap: raw MCTS at a fixed depth doesn't get stronger
-no matter how many times it's re-run, so once `data/logs/pretrain_log.csv` /
-`python network_tournament.py` results plateau, the intended next step is
-`python project.py`, not more pretraining rounds. `data/Networks/Pretrain_N.keras`
-numbering restarts at 0 every `pretrain.py` run, the same footgun `Episode_N` already has
-(see "Starting/resuming a run" above) - a second pretraining run (e.g. after manually
-regenerating the pool) can silently overwrite the first run's checkpoint files, though
-`data/Network.keras` itself always holds the latest weights regardless.
 
 ## 3. MCTS node lifecycle
 
@@ -159,8 +121,8 @@ evaluating leaves:
 - **Root Dirichlet noise, self-play only.** `MCTS.search(add_root_noise=True)` mixes
   `dirichlet_epsilon` worth of `Dirichlet(dirichlet_alpha)` noise into the root's priors right
   after its first evaluation, before any UCB descent uses them. Only self-play passes
-  `add_root_noise=True`; evaluation/head-to-head play (`NetworkMCTSAgent`, `test_network_vs_mcts`,
-  etc.) does not, so noise never affects real play strength measurement.
+  `add_root_noise=True`; evaluation/head-to-head play (gating, tournaments, etc.) does not, so
+  noise never affects real play strength measurement.
 - **Temperature annealing.** `simulate_self_play_games()` samples moves proportional to visit
   counts (`p=mcts.pi`) for the first `temperature_moves` plies of a game, then plays greedily
   (`argmax`) afterward.
@@ -181,20 +143,14 @@ evaluating leaves:
 - `mcts.exploration_parameter` — PUCT exploration constant.
 - `mcts.search_depth` — MCTS iterations per move.
 - `mcts.dirichlet_alpha` / `mcts.dirichlet_epsilon` — root noise shape/weight during self-play (§4).
-- `mcts.pretrain_mcts_depth` — MCTS iterations per move for network-free pretraining pool generation
-  (`uttt/training/generate_raw_pool.py`), independent of `mcts.search_depth`.
-- `self_play.num_of_processes` — parallel self-play worker processes per episode; also the worker
-  count `uttt/training/generate_raw_pool.py` uses per generation batch.
-- `self_play.num_of_self_play_games_per_process` — games each worker plays before returning; also
-  reused by `uttt/simulation/raw_mcts.py` for pretraining generation batches.
-- `self_play.num_of_testing_games` — games per champion-vs-candidate gating match each episode
-  (§2), and separately per evaluation match in `test_network_vs_mcts()`/`test_raw_network_vs_random()`.
+- `self_play.num_of_processes` — parallel self-play worker processes per episode.
+- `self_play.num_of_self_play_games_per_process` — games each worker plays before returning.
+- `self_play.num_of_testing_games` — games per champion-vs-candidate gating match each episode (§2).
 - `self_play.promotion_win_rate` — minimum share of decisive gating games the candidate must win to
   be promoted (§2, §4).
 - `self_play.temperature_moves` — plies played proportional-to-visits before switching to greedy
-  (§4); same schedule reused by pretraining generation.
-- `training.num_of_episodes` — outer training loop length; reused as the round count for
-  `PretrainManager.pretrain()`.
+  (§4).
+- `training.num_of_episodes` — outer training loop length.
 - `training.training_sample_size` — examples sampled from the replay buffer to fit on each episode.
 - `training.minibatch_size` — `batch_size` passed to `model.fit`.
 - `training.training_epochs` / `training.training_patience` — max epochs and `EarlyStopping`
@@ -207,16 +163,29 @@ evaluating leaves:
   multiplied using them, which is otherwise a cheap way to get more mileage out of self-play data.
 - **No batched leaf evaluation (virtual loss).** Each MCTS leaf still costs one model call; real
   AlphaZero implementations batch several pending leaf evaluations into one forward pass.
-- **`test_network_vs_mcts()` / `test_raw_network_vs_random()` are print-only.** Unlike the
-  champion-vs-candidate gating match (logged to `data/logs/gating_log.csv`) and training metrics
-  (logged to `data/logs/training_log.csv`), these two baseline evaluations only `print()` a W/D/L
-  line per episode — nothing is written to a file.
-- **`uttt/evaluation/elo.py`/`uttt/evaluation/network_tournament.py`** are standalone analysis
-  tools, not wired into the training loop.
-- **Pretraining pool has no versioning/lineage.** Regenerating `data/PretrainExamples/pool.pkl`
-  (e.g. `rm data/PretrainExamples/pool.pkl && python pretrain.py`) is a manual, destructive
-  replace — there's no way to compare, mix, or trace which `data/Networks/Pretrain_N.keras`
-  checkpoint was trained against which pool generation.
-- **`Project.ipynb` / `.ipynb_checkpoints`** are stale relative to `project.py` and reference
-  removed patterns (e.g. `TTTBoard`, `disable_eager_execution()`); treat `project.py` as the
-  source of truth.
+- **`uttt/evaluation/network_tournament.py`** is a standalone analysis tool, not wired into the
+  training loop.
+
+## 7. Auditability & logging
+
+`uttt/run_logging.py` holds two pieces of infrastructure used by a long training run, orthogonal
+to each other:
+
+- **`snapshot_config()`** (called once, in `TrainingManager.__init__`) writes the live `config`
+  dict to `data/logs/config_history/config_v{config['version']}.json` the first time that version
+  number is seen — a no-op on later calls with the same version, so it's safe to call every run.
+  `version` is hand-bumped in `uttt/config.py`, not derived from anything (not a hash, not git) —
+  if you edit a hyperparameter without bumping it, the next `snapshot_config()` call detects the
+  mismatch against the existing snapshot and prints a warning, but does not overwrite the snapshot
+  or block the run. Every row of `data/logs/training_log.csv` and `data/logs/gating_log.csv` is
+  stamped with `config_version`, so an episode's exact hyperparameters are recoverable later via
+  that file even after `config.py` has since changed further.
+- **`start_console_log()`** (called once, in `project.py`) tees `sys.stdout`/`sys.stderr` through
+  to a new file per process under `data/logs/console/run_<start-timestamp>.log`, in addition to the
+  terminal — nothing printed anywhere in the process (self-play/gating progress, `print_settings()`,
+  Keras's own `fit()` output) is lost if the terminal session ends. Every row of `training_log.csv`/
+  `gating_log.csv` also carries a `timestamp`, which is how you'd locate the matching console log
+  for a given episode (e.g. to find a stack trace).
+
+Both CSVs' `episode` column is the join key back to `data/TrainingExamples/Episode_N` and (for
+promoted episodes) `data/Networks/Episode_N.keras`.

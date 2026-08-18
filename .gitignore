@@ -15,18 +15,3 @@ Thumbs.db
 # always deletes them afterward, but ignore them in case a run gets killed mid-gating).
 data/Networks/_candidate_tmp.keras
 data/Networks/_gating_candidate.keras
-
-# Large raw-MCTS example pool. Regenerable via `python pretrain.py`, so not tracked.
-data/PretrainExamples/
-
-# Large, regenerable self-play artifacts from past runs. These sit at the repo root,
-# outside data/, and nothing in the active code reads them (see CLAUDE.md/
-# ARCHITECTURE_OVERVIEW.md); individual files run into the hundreds of MB - past
-# GitHub's 100MB per-file limit - so they are never tracked.
-self_play_Networks/
-self_play_TrainingExamples/
-
-# NOT ignored: data/Network.keras (current champion), data/Networks/ (promoted
-# checkpoints), and data/TrainingExamples/ (replay buffer) are what project.py /
-# pretrain.py resume from, so they need to travel to the Windows desktop for training
-# to continue rather than restart.

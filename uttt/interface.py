@@ -17,10 +17,8 @@ import numpy as np
 import pygame
 import tensorflow as tf
 
-from uttt.config import config
 from uttt.paths import NETWORK_PATH
 from uttt.search.mcts import MCTS
-from uttt.board.uttt_board import UTTTBoard
 
 
 # --- Board geometry -----------------------------------------------------
@@ -100,7 +98,7 @@ class InterfaceAgent:
     """Wraps an MCTS tree with runtime-adjustable search depth and move-selection
     style, so a single agent instance can be tuned live from the UI instead of
     being locked to one PlayerAgent subclass (see uttt/player/agent.py's
-    NetworkMCTSAgent/ProbabilisticNetworkMCTSAgent, which hardcode one or the other).
+    ProbabilisticNetworkMCTSAgent, which hardcodes probabilistic move selection).
     """
 
     def __init__(self, network, name):
@@ -345,7 +343,6 @@ def run_spectate_mode(network1_path, network2_path, depth):
         return x_agent if x_agent.board.x_move else o_agent
 
     def dispatch_if_ready():
-        nonlocal next_dispatch_time
         board = x_agent.board
         if (not worker.busy) and (not paused) and (not board.is_game_over()) and time.time() >= next_dispatch_time:
             worker.start(current_agent(), depth, deterministic)

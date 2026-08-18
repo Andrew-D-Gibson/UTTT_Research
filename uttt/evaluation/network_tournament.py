@@ -16,9 +16,8 @@ from uttt.paths import NETWORKS_DIR, TOURNAMENT_LOG_PATH, TOURNAMENT_SNAPSHOT_RO
 
 
 def discover_checkpoints(networks_dir=NETWORKS_DIR, prefix='Episode'):
-    # Scans networks_dir for <prefix>_N.keras files - 'Episode' for self-play
-    # training (uttt/training/manager.py), 'Pretrain' for the raw-MCTS bootstrap phase
-    # (uttt/training/pretrain_manager.py). Prints an episode -> mtime table so a mixed-run
+    # Scans networks_dir for <prefix>_N.keras files (self-play checkpoints written by
+    # uttt/training/manager.py). Prints an episode -> mtime table so a mixed-run
     # situation (mtime decreasing as episode number increases, meaning a
     # lower-numbered episode from a newer run overwrote a higher-numbered one from
     # an older run) is visible before anything else happens.
@@ -95,10 +94,9 @@ def build_network_specs(snapshotted, prefix='Episode'):
     # bookkeeping role of tracking names/Elo, exactly like TrainingManager never touches
     # game logic and only aggregates what its self-play/gating workers report back.
     # 'network' agents are ProbabilisticNetworkMCTSAgent (samples moves proportional to
-    # visit counts) rather than the deterministic NetworkMCTSAgent used by
-    # test_network_vs_mcts: two deterministic agents playing a fixed color order would
-    # replay bit-for-bit identical games every time, so repeated tournament games
-    # between the same pair would add no information.
+    # visit counts), not a deterministic argmax agent: two deterministic agents playing
+    # a fixed color order would replay bit-for-bit identical games every time, so
+    # repeated tournament games between the same pair would add no information.
     specs = [
         {'kind': 'network', 'name': f'{prefix}_{episode}', 'path': snapshotted[episode], 'depth': None}
         for episode in sorted(snapshotted)
@@ -119,7 +117,7 @@ def build_raw_mcts_specs(depths):
 
 
 def _agent_kind_and_episode(name):
-    if name.startswith('Episode_') or name.startswith('Pretrain_'):
+    if name.startswith('Episode_'):
         return 'network', name.split('_', 1)[1]
     return 'raw_mcts', ''
 
@@ -226,18 +224,12 @@ def run_default():
          "use their own fixed depths regardless of uttt/config.py.\n"
      )
 
-     # Two independent ladders, since Episode_N (self-play) and Pretrain_N (raw-MCTS
-     # bootstrap - see pretrain_manager.py) checkpoints share the numeric episode
-     # namespace but not the Networks/ filename prefix. Either can be empty (e.g.
-     # no self-play run yet) without breaking the other.
     network_specs = []
-    for prefix in ('Episode', 'Pretrain'):
-        found = discover_checkpoints(prefix=prefix)
-        if not found:
-            continue
+    found = discover_checkpoints(prefix='Episode')
+    if found:
         selected = select_ladder(found, target_count=TARGET_LADDER_SIZE)
-        snapshotted = snapshot_checkpoints(selected, prefix=prefix)
-        network_specs += build_network_specs(snapshotted, prefix=prefix)
+        snapshotted = snapshot_checkpoints(selected, prefix='Episode')
+        network_specs += build_network_specs(snapshotted, prefix='Episode')
 
     raw_specs = build_raw_mcts_specs(RAW_MCTS_DEPTHS)
     run_tournament(network_specs + raw_specs, iterations=ITERATIONS,

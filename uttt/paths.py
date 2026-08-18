@@ -12,18 +12,20 @@ DATA_DIR = os.path.join(PROJECT_ROOT, 'data')
 NETWORK_PATH = os.path.join(DATA_DIR, 'Network.keras')
 NETWORKS_DIR = os.path.join(DATA_DIR, 'Networks')
 TRAINING_EXAMPLES_DIR = os.path.join(DATA_DIR, 'TrainingExamples')
-PRETRAIN_DIR = os.path.join(DATA_DIR, 'PretrainExamples')
-PRETRAIN_POOL_PATH = os.path.join(PRETRAIN_DIR, 'pool.pkl')
+CURRENT_TRAINING_EXAMPLES_PATH = os.path.join(TRAINING_EXAMPLES_DIR, 'current_training_examples.pkl')
 
 LOGS_DIR = os.path.join(DATA_DIR, 'logs')
 TRAINING_LOG_PATH = os.path.join(LOGS_DIR, 'training_log.csv')
 GATING_LOG_PATH = os.path.join(LOGS_DIR, 'gating_log.csv')
-PRETRAIN_LOG_PATH = os.path.join(LOGS_DIR, 'pretrain_log.csv')
+CONFIG_HISTORY_DIR = os.path.join(LOGS_DIR, 'config_history')
+CONSOLE_LOG_DIR = os.path.join(LOGS_DIR, 'console')
+EPOCH_HISTORY_DIR = os.path.join(LOGS_DIR, 'epoch_history')
 
 TOURNAMENT_LOG_PATH = os.path.join(LOGS_DIR, 'tournament_log.csv')
 TOURNAMENT_SNAPSHOT_ROOT = os.path.join(NETWORKS_DIR, 'tournament_snapshots')
 
 
 def ensure_data_dirs():
-    for directory in (DATA_DIR, NETWORKS_DIR, TRAINING_EXAMPLES_DIR, PRETRAIN_DIR, LOGS_DIR):
+    for directory in (DATA_DIR, NETWORKS_DIR, TRAINING_EXAMPLES_DIR, LOGS_DIR,
+                       CONFIG_HISTORY_DIR, CONSOLE_LOG_DIR, EPOCH_HISTORY_DIR):
         os.makedirs(directory, exist_ok=True)

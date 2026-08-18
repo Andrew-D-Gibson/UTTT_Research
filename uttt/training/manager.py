@@ -1,42 +1,55 @@
 # Library imports
 import os
 import csv
+import json
 import time
 import queue
 import numpy as np
 import multiprocessing as mp
 import tensorflow as tf
 import pickle
+from datetime import datetime
 
 # Function imports
+from uttt.board.symmetry import apply_board_symmetry, apply_move_vector_symmetry, NUM_SYMMETRIES
 from uttt.simulation.self_play import simulate_self_play_games
 from uttt.simulation.gating import simulate_gating_games
-from uttt.player.agent import test_network_vs_mcts, test_raw_network_vs_random
 
 from uttt.config import config
 from uttt.paths import (
     NETWORK_PATH,
     NETWORKS_DIR,
     TRAINING_EXAMPLES_DIR,
+    CURRENT_TRAINING_EXAMPLES_PATH,
     TRAINING_LOG_PATH,
     GATING_LOG_PATH,
+    EPOCH_HISTORY_DIR,
     ensure_data_dirs,
 )
+from uttt.run_logging import snapshot_config, new_session_id
 
 class TrainingManager:
-    def __init__(self):
+    def __init__(self, session_id=None):
         ensure_data_dirs()
+        snapshot_config()
+
+        self.session_id = session_id or new_session_id()
 
         self.network = tf.keras.models.load_model(NETWORK_PATH)
 
         self.training_examples = self.load_latest_training_examples()
         self.log_path = TRAINING_LOG_PATH
         self.log_fields = [
-            'episode', 'num_examples', 'epochs_run', 'epochs_configured', 'stopped_early',
+            'episode', 'timestamp', 'session_id', 'config_version', 'champion_episode',
+            'self_play_games', 'self_play_avg_plies', 'self_play_duration_s',
+            'new_examples', 'buffer_size',
+            'training_sample_size', 'training_duration_s',
+            'epochs_run', 'epochs_configured', 'stopped_early',
             'train_loss', 'val_loss',
             'train_policy_loss', 'val_policy_loss',
             'train_value_loss', 'val_value_loss',
             'train_policy_acc', 'val_policy_acc',
+            'episode_duration_s',
         ]
 
         # Long-lived so every episode can hand out a fresh Queue from it without
@@ -47,41 +60,19 @@ class TrainingManager:
         self.promotions = 0
         self.last_promoted_episode = None
 
-    def load_latest_training_examples(self, directory=TRAINING_EXAMPLES_DIR):
-        # Jump-starts the replay buffer from whatever's left in TrainingExamples/
-        # instead of always starting from an empty buffer. Each saved file already
-        # holds the *entire* buffer as of that episode (not just that episode's new
-        # examples - see train()), so the single most recent file already is
-        # essentially the full prior buffer; there's no need to merge multiple files.
-        if not os.path.isdir(directory):
-            return []
-
-        paths = [os.path.join(directory, f) for f in os.listdir(directory) if not f.startswith('.')]
-        if not paths:
+    def load_latest_training_examples(self, path=CURRENT_TRAINING_EXAMPLES_PATH):
+        # Jump-starts the replay buffer from the master buffer file instead of always
+        # starting empty. Episode_N files are a separate per-episode audit trail of
+        # just that episode's fresh examples (see train()) - they're never read back
+        # here, only this one fixed-name file is.
+        if not os.path.exists(path):
             print('No existing training examples found - starting with an empty replay buffer.')
             return []
 
-        # Picking by mtime rather than parsing the highest Episode_N: episode
-        # numbering restarts at 0 every run, so a stale file from an earlier run can
-        # have a higher N than this run's real latest (same footgun uttt/evaluation/network_tournament.py
-        # already has to account for with Networks/Episode_N.keras).
-        latest_path = max(paths, key=os.path.getmtime)
-
-        with open(latest_path, 'rb') as file:
+        with open(path, 'rb') as file:
             examples = pickle.load(file)
 
-        print(f'Resuming replay buffer from {latest_path} ({len(examples)} training examples)')
-
-        # Keep only the file just loaded, under one fixed backup name, so it can
-        # never collide with this run's own Episode_N files and repeated restarts
-        # don't pile up backups. Everything else gets removed so old/new run
-        # numbering never coexists ambiguously.
-        backup_path = os.path.join(directory, '_resumed_from.pkl')
-        if latest_path != backup_path:
-            os.replace(latest_path, backup_path)
-        for path in paths:
-            if path not in (latest_path, backup_path) and os.path.exists(path):
-                os.remove(path)
+        print(f'Resuming replay buffer from {path} ({len(examples)} training examples)')
 
         return examples
 
@@ -93,14 +84,18 @@ class TrainingManager:
                 writer.writeheader()
             writer.writerow(row)
 
-    def log_gating_result(self, episode, candidate_wins, draws, champion_wins, promoted):
+    def log_gating_result(self, episode, timestamp, champion_episode, duration,
+                           candidate_wins, draws, champion_wins, win_rate, promoted):
         path = GATING_LOG_PATH
         file_exists = os.path.exists(path)
         with open(path, 'a', newline='') as file:
             writer = csv.writer(file)
             if not file_exists:
-                writer.writerow(['episode', 'candidate_wins', 'draws', 'champion_wins', 'promoted'])
-            writer.writerow([episode, candidate_wins, draws, champion_wins, promoted])
+                writer.writerow(['episode', 'timestamp', 'session_id', 'config_version', 'champion_episode',
+                                  'gating_duration_s', 'candidate_wins', 'draws', 'champion_wins',
+                                  'win_rate', 'promoted'])
+            writer.writerow([episode, timestamp, self.session_id, config['version'], champion_episode,
+                              duration, candidate_wins, draws, champion_wins, win_rate, promoted])
 
     def clone_network(self, network):
         # fit() mutates weights in place, so training the champion directly would
@@ -114,14 +109,28 @@ class TrainingManager:
         os.remove(tmp_path)
         return clone
 
-    def train_on_examples(self, network, examples, episode):
+    def train_on_examples(self, network, examples):
         board_train = np.empty((len(examples),9,9,4))
         search_probs_train = np.empty((len(examples),81))
         eval_train = np.empty((len(examples),1))
 
+        # Each example is stored in the buffer in one canonical orientation (see
+        # TrainingExample); reorienting here rather than at self-play record time means
+        # the same stored example gets a fresh random symmetry every time it's sampled
+        # into a training batch, so its exposure varies episode to episode instead of
+        # being permanently pinned to whatever orientation it was recorded under.
+        augment = config['training']['random_symmetry_augmentation']
         for i, example in enumerate(examples):
-            board_train[i,:,:,:] = example.board_array
-            search_probs_train[i,:] = example.search_probs
+            board_array = example.board_array
+            search_probs = example.search_probs
+
+            if augment:
+                symmetry_index = np.random.randint(NUM_SYMMETRIES)
+                board_array = apply_board_symmetry(board_array, symmetry_index)
+                search_probs = apply_move_vector_symmetry(search_probs, symmetry_index)
+
+            board_train[i,:,:,:] = board_array
+            search_probs_train[i,:] = search_probs
             eval_train[i] = example.reward
 
         # A single shuffled pass over a large sample of the buffer, with a real
@@ -163,9 +172,11 @@ class TrainingManager:
         print(f' Value  train/val loss: {train_value_loss:.4f} / {val_value_loss:.4f}')
         print(f' Epochs: {epoch_note}')
 
-        self.log_metrics({
-            'episode': episode,
-            'num_examples': len(examples),
+        # Returned rather than logged here - train() assembles one full per-episode row
+        # (self-play stats, timing, these metrics) and writes it in a single log_metrics call.
+        # 'epoch_history' carries the full per-epoch curve (h itself only has the last epoch's
+        # values pulled out above) for train() to dump separately - it isn't a CSV column.
+        return {
             'epochs_run': epochs_run,
             'epochs_configured': epochs_configured,
             'stopped_early': stopped_early,
@@ -173,13 +184,10 @@ class TrainingManager:
             'train_policy_loss': train_policy_loss, 'val_policy_loss': val_policy_loss,
             'train_value_loss': train_value_loss, 'val_value_loss': val_value_loss,
             'train_policy_acc': train_policy_acc, 'val_policy_acc': val_policy_acc,
-        })
+            'epoch_history': {key: [float(v) for v in values] for key, values in h.items()},
+        }
 
 
-    def log_result(self, result):
-        self.training_examples.extend(result)
-
-        
     def print_settings(self):
         games_per_episode = config['self_play']['num_of_processes'] * config['self_play']['num_of_self_play_games_per_process']
         print('=== Training run settings ===')
@@ -190,8 +198,7 @@ class TrainingManager:
               f"{config['self_play']['num_of_self_play_games_per_process']} games/process "
               f"({games_per_episode} games/episode), "
               f"temperature_moves={config['self_play']['temperature_moves']}, "
-              f"gating/testing_games={config['self_play']['num_of_testing_games']}, "
-              f"baseline_games={config['self_play']['num_of_baseline_games']}")
+              f"gating/testing_games={config['self_play']['num_of_testing_games']}")
         print(f"  training:  sample_size={config['training']['training_sample_size']}, "
               f"minibatch={config['training']['minibatch_size']}, "
               f"epochs<={config['training']['training_epochs']} (patience={config['training']['training_patience']}), "
@@ -209,16 +216,25 @@ class TrainingManager:
         progress_queue = self.mp_manager.Queue()
 
         pool = mp.Pool(num_processes)
-        for i in range(num_processes):
-            pool.apply_async(simulate_self_play_games, args=(progress_queue,), callback=self.log_result)
+        async_results = [
+            pool.apply_async(simulate_self_play_games, args=(progress_queue,))
+            for _ in range(num_processes)
+        ]
         pool.close()
 
-        # Drain progress from all workers into one consolidated stream instead of
-        # num_processes workers each writing to stdout independently.
+        # Bounded-wait drain, mirroring run_gating(): an unconditional blocking queue.get()
+        # would hang the run forever, with no error and no log output, if a worker died
+        # before delivering its full quota of progress messages.
         games_done = 0
         total_plies = 0
         while games_done < total_games:
-            pid, game_idx, worker_num_games, plies, duration = progress_queue.get()
+            try:
+                pid, game_idx, worker_num_games, plies, duration = progress_queue.get(timeout=5)
+            except queue.Empty:
+                if all(r.ready() for r in async_results):
+                    break
+                continue
+
             games_done += 1
             total_plies += plies
             elapsed = time.time() - self_play_start_time
@@ -228,10 +244,19 @@ class TrainingManager:
 
         pool.join()
 
+        # .get() (not the old callback=) so a worker exception is re-raised here instead of
+        # silently under-filling the replay buffer this episode was supposed to receive.
+        new_examples = []
+        for r in async_results:
+            new_examples.extend(r.get())
+        self.training_examples.extend(new_examples)
+
         self_play_elapsed = time.time() - self_play_start_time
         print(f'Self-play done in {self_play_elapsed:.1f}s '
               f'({self_play_elapsed/total_games:.1f}s/game avg, {total_plies/total_games:.1f} plies/game avg)')
         print(f'Replay buffer: {len(self.training_examples)} examples')
+
+        return self_play_elapsed, total_games, total_plies, new_examples
 
     def run_gating(self, candidate):
         num_processes = config['self_play']['num_of_processes']
@@ -310,7 +335,7 @@ class TrainingManager:
             gating_elapsed = time.time() - gating_start_time
             print(f'Gating done in {gating_elapsed:.1f}s ({gating_elapsed/total_games:.1f}s/game avg)')
 
-            return candidate_wins, draws, champion_wins
+            return candidate_wins, draws, champion_wins, gating_elapsed
         finally:
             if os.path.exists(candidate_path):
                 os.remove(candidate_path)
@@ -320,10 +345,16 @@ class TrainingManager:
 
         for episode in range(config['training']['num_of_episodes']):
             episode_start_time = time.time()
+            episode_timestamp = datetime.now().isoformat(timespec='seconds')
 
             print(f'\n\n===== Episode {episode} =====')
 
-            self.run_self_play()
+            # The champion self-play/gating actually played against this episode - captured
+            # before gating below can update last_promoted_episode, so it reflects what was
+            # really in data/Network.keras during this episode, not what it becomes after.
+            champion_episode = self.last_promoted_episode if self.last_promoted_episode is not None else -1
+
+            self_play_duration, self_play_games, self_play_total_plies, new_examples = self.run_self_play()
 
             # If we have too many examples, remove from the front
             if len(self.training_examples) > config['training']['max_training_examples']:
@@ -332,7 +363,13 @@ class TrainingManager:
             # Save training examples now, right after self-play finishes and before
             # training the candidate - so a crash/interruption during training or
             # gating doesn't lose an episode's worth of fresh self-play games.
+            # Episode_N is a permanent per-episode audit trail of just this episode's
+            # fresh examples (never trimmed, never read back in); the master buffer
+            # file is what actually gets resumed from and reflects the trimmed cap.
             with open(os.path.join(TRAINING_EXAMPLES_DIR, f'Episode_{episode}'), 'wb') as file:
+                pickle.dump(new_examples, file)
+
+            with open(CURRENT_TRAINING_EXAMPLES_PATH, 'wb') as file:
                 pickle.dump(self.training_examples, file)
 
             # Train a candidate cloned from the current champion on a large shuffled
@@ -346,15 +383,23 @@ class TrainingManager:
             print(f'Training on {sample_size} examples (sampled from {len(self.training_examples)} in buffer)')
 
             candidate = self.clone_network(self.network)
-            self.train_on_examples(candidate, training_sample, episode)
+            metrics = self.train_on_examples(candidate, training_sample)
 
-            print(f'Training took {time.time() - training_start_time:.1f}s')
+            # Full per-epoch curve for this episode's fit() call - the CSV row below only
+            # keeps the final epoch's numbers, this keeps the whole trajectory for later
+            # inspection (e.g. within-episode overfitting) without bloating training_log.csv.
+            epoch_history = metrics.pop('epoch_history')
+            with open(os.path.join(EPOCH_HISTORY_DIR, f'Episode_{episode}.json'), 'w') as file:
+                json.dump(epoch_history, file)
+
+            training_duration = time.time() - training_start_time
+            print(f'Training took {training_duration:.1f}s')
 
             # Gate: the candidate must beat the champion head-to-head to be promoted.
             # A tie or a loss keeps the existing champion, and no checkpoint is saved
             # for this episode - Networks/ ends up sparse, reflecting only verified
             # improvements rather than every training round.
-            candidate_wins, draws, champion_wins = self.run_gating(candidate)
+            candidate_wins, draws, champion_wins, gating_duration = self.run_gating(candidate)
 
             # Require a clear margin over decisive (non-drawn) games rather than a bare
             # majority - with num_of_testing_games in the tens, wins-vs-losses margins of
@@ -366,7 +411,8 @@ class TrainingManager:
             print(f'Candidate vs champion W/D/L: {candidate_wins}/{draws}/{champion_wins} '
                   f'(win rate {win_rate:.1%} of decisive games) -> {verdict}')
 
-            self.log_gating_result(episode, candidate_wins, draws, champion_wins, promoted)
+            self.log_gating_result(episode, episode_timestamp, champion_episode, gating_duration,
+                                    candidate_wins, draws, champion_wins, win_rate, promoted)
 
             self.episodes_run += 1
             if promoted:
@@ -379,11 +425,22 @@ class TrainingManager:
             last_promo_note = f'episode {self.last_promoted_episode}' if self.last_promoted_episode is not None else 'none yet'
             print(f'Promotions so far: {self.promotions}/{self.episodes_run} episodes (last: {last_promo_note})')
 
-            # if promoted:
-            #     print('--- Baseline evaluation ---')
-            #     test_network_vs_mcts()
-            #     test_raw_network_vs_random()
-            # else:
-            #     print('--- Baseline evaluation skipped (champion unchanged, already benchmarked) ---')
+            episode_duration = time.time() - episode_start_time
+            print(f'===== Episode {episode} done in {episode_duration:.1f}s =====')
 
-            print(f'===== Episode {episode} done in {time.time() - episode_start_time:.1f}s =====')
+            self.log_metrics({
+                'episode': episode,
+                'timestamp': episode_timestamp,
+                'session_id': self.session_id,
+                'config_version': config['version'],
+                'champion_episode': champion_episode,
+                'self_play_games': self_play_games,
+                'self_play_avg_plies': self_play_total_plies / self_play_games if self_play_games else 0,
+                'self_play_duration_s': self_play_duration,
+                'new_examples': len(new_examples),
+                'buffer_size': len(self.training_examples),
+                'training_sample_size': sample_size,
+                'training_duration_s': training_duration,
+                'episode_duration_s': episode_duration,
+                **metrics,
+            })

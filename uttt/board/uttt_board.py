@@ -167,23 +167,49 @@ class UTTTBoard:
     def get_array_representation(self):
         array = np.empty((9,9,4))
 
-        # Player positions
-        array[:,:,0] = self.symbol_array_representation(self.x)
-        array[:,:,1] = self.symbol_array_representation(self.o)
-
-        # Whose move it is
+        # Canonicalized from the perspective of the player to move: channel 0 is
+        # always "my" stones and channel 1 is always "their" stones, rather than
+        # fixed X/O channels plus a separate turn flag. This means the network sees
+        # one consistent frame regardless of which side is playing, instead of
+        # having to learn the X and O cases separately.
         if self.x_move:
-            array[:,:,2] = np.ones((9,9))
+            mover, opponent = self.x, self.o
+            mover_subboards, opponent_subboards = self.subboard_x, self.subboard_o
         else:
-            array[:,:,2] = np.zeros((9,9))
-            
+            mover, opponent = self.o, self.x
+            mover_subboards, opponent_subboards = self.subboard_o, self.subboard_x
+        array[:,:,0] = self.symbol_array_representation(mover)
+        array[:,:,1] = self.symbol_array_representation(opponent)
+
         # Which subboards are eligible for moving in
         eligible_subboards_bitboard = 0 # 81 bits
         for subboard in self.eligible_subboards:
             eligible_subboards_bitboard |= 0b111111111 << (subboard * 9)
-        array[:,:,3] = self.symbol_array_representation(eligible_subboards_bitboard)
-        
+        array[:,:,2] = self.symbol_array_representation(eligible_subboards_bitboard)
+
+        # Subboard win status: +1 across every cell of a subboard the mover has won,
+        # -1 across every cell of one the opponent has won, 0 elsewhere (including
+        # drawn subboards - subboard_draws isn't used here, only subboard_x/o - and
+        # undecided ones). A subboard can never be won by both sides, so this
+        # subtraction always lands on exactly +1/-1/0 - cast to a signed dtype first,
+        # since symbol_array_representation returns uint8 and 0-1 would wrap to 255.
+        mover_won = self.symbol_array_representation(self._expand_subboard_mask(mover_subboards)).astype(np.int8)
+        opponent_won = self.symbol_array_representation(self._expand_subboard_mask(opponent_subboards)).astype(np.int8)
+        array[:,:,3] = mover_won - opponent_won
+
         return array
+
+
+    def _expand_subboard_mask(self, subboard_bitmask):
+        # Broadcasts a 9-bit per-subboard bitmask (bit i = subboard i) into the
+        # 81-bit per-move bitboard symbol_array_representation expects, by OR-ing in
+        # a full subboard (0b111111111 << subboard*9) for each set bit - the same
+        # technique the eligible-subboards channel above already uses.
+        expanded = 0
+        for subboard in range(9):
+            if subboard_bitmask & (1 << subboard):
+                expanded |= 0b111111111 << (subboard * 9)
+        return expanded
     
     
     def symbol_array_representation(self, symbol_bitboard):
@@ -207,13 +233,17 @@ class UTTTBoard:
     
     
     def print(self):
-        array = self.get_array_representation()
-            
+        # Displayed as literal X/O regardless of whose turn it is - independent of
+        # get_array_representation(), which is canonicalized to mover/opponent for
+        # network input and would otherwise make this display flip meaning each ply.
+        x_array = self.symbol_array_representation(self.x)
+        o_array = self.symbol_array_representation(self.o)
+
         for i in range(9):
             for j in range(9):
-                if array[i,j,0]:
+                if x_array[i,j]:
                     print(' x ', end='')
-                elif array[i,j,1]:
+                elif o_array[i,j]:
                     print(' o ', end='')
                 else:
                     print(' . ', end ='')

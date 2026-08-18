@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "mcts": {
+    "exploration_parameter": 1.5,
+    "search_depth": 512,
+    "dirichlet_alpha": 1.2,
+    "dirichlet_epsilon": 0.25
+  },
+  "self_play": {
+    "num_of_processes": 12,
+    "num_of_self_play_games_per_process": 40,
+    "num_of_testing_games": 60,
+    "promotion_win_rate": 0.55,
+    "temperature_moves": 20
+  },
+  "training": {
+    "num_of_episodes": 100,
+    "training_sample_size": 40000,
+    "minibatch_size": 512,
+    "training_epochs": 10,
+    "training_patience": 3,
+    "max_training_examples": 400000,
+    "random_symmetry_augmentation": true
+  }
+}

@@ -90,12 +90,17 @@ class MCTS():
         # overhead while staying in normal eager mode.
         board_arrays = np.array([board.get_array_representation()])
 
-        search_probs, value_est = self.network(board_arrays, training=False)
-        search_probs = search_probs.numpy()
-        value_est = value_est.numpy()
+        outputs = self.network(board_arrays, training=False)
+        search_probs = outputs['policy_output'].numpy()
+        value_est = outputs['value_output'].numpy()
 
-        self.search_probs = np.squeeze(search_probs)[board.find_moves()]  # Get only the search probs for valid moves
-        self.search_probs /= self.search_probs.sum() # Re-normalize after
+        legal_logits = np.squeeze(search_probs)[board.find_moves()]  # Get only the logits for valid moves
+        # Softmax over legal moves only (masking then softmaxing full-board logits
+        # would let illegal moves' logits skew the normalization); subtract the max
+        # first for numerical stability, standard log-sum-exp trick.
+        legal_logits -= legal_logits.max()
+        exp_logits = np.exp(legal_logits)
+        self.search_probs = exp_logits / exp_logits.sum()
 
         value_est = np.squeeze(value_est)
 

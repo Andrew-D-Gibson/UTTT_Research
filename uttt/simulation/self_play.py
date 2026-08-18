@@ -16,7 +16,7 @@ def simulate_self_play_games(progress_queue=None):
 
     configure_cpu_worker()
 
-    network = tf.keras.models.load_model(NETWORK_PATH)
+    network = tf.keras.models.load_model(NETWORK_PATH, compile=False)
     mcts = MCTS(network = network)
 
     num_games = config['self_play']['num_of_self_play_games_per_process']

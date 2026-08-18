@@ -127,7 +127,7 @@ class InterfaceAgent:
 
 def load_network(path):
     print(f'Loading network: {path}')
-    return tf.keras.models.load_model(path)
+    return tf.keras.models.load_model(path, compile=False)
 
 
 def draw_board(screen, board, fonts, highlight_eligible):

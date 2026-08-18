@@ -3,7 +3,8 @@ import tensorflow as tf
 
 from uttt.board.symmetry import MOVE_TO_ARRAY_FLAT_INDEX
 
-
+## BROKEN IN THE CURRENT IMPLEMENTATION
+## THIS OUTPUTS A SOFTMAX ALREADY, BUT WE CALCULATE IT LATER AFTER REMOVING ILLEGAL MOVES RIGHT NOW
 def convNet():
     ultimate_tic_tac_toe_input = tf.keras.layers.Input(shape=(9,9,4), name='uttt_input')
 
@@ -41,7 +42,7 @@ def convNet():
 # based on. Kept modest in scale (not AlphaZero-sized) per the design brief.
 NUM_CHANNELS = 4
 META_FILTERS = 128
-NUM_RES_BLOCKS = 2
+NUM_RES_BLOCKS = 3
 L2_WEIGHT = 1e-4
 
 POLICY_META_BRANCH_FILTERS = 32     # channels after reducing meta_features for broadcast

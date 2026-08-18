@@ -7,15 +7,15 @@ config = {
 
     'mcts': {
         'exploration_parameter': 1.5,
-        'search_depth': 1024,           
+        'search_depth': 512,           
         'dirichlet_alpha': 1.2,       # root exploration noise (AlphaZero-style)
         'dirichlet_epsilon': 0.25,    # weight of noise vs. network prior at the root
     },
 
     'self_play': {
         'num_of_processes': 12,                     
-        'num_of_self_play_games_per_process': 80, 
-        'num_of_testing_games': 240,       # candidate vs. champion gating match total, parallelized across num_of_processes
+        'num_of_self_play_games_per_process': 40,  
+        'num_of_testing_games': 60,       # 240? candidate vs. champion gating match total, parallelized across num_of_processes
         'promotion_win_rate': 0.55,       # candidate must win >= this share of decisive (non-drawn) gating games to be promoted
         'temperature_moves': 20,       # sample proportional to visit counts for this many plies, then play greedy
     },

@@ -15,19 +15,21 @@ from uttt.config import config
 # through Pool's per-task dispatch queue (apply_async args), which raises
 # "Queue objects should only be shared between processes through inheritance".
 # Mirrors uttt/simulation/tournament.py's _agents/init_tournament_worker pattern.
-_request_queue = None
+# One queue per distinct GPU (see TrainingManager.start_inference_servers) - InferenceClient
+# round-robins across them so load actually splits evenly across GPUs.
+_request_queues = None
 
 
-def init_self_play_worker(request_queue):
-    global _request_queue
-    _request_queue = request_queue
+def init_self_play_worker(request_queues):
+    global _request_queues
+    _request_queues = request_queues
     seed_worker_rng()
 
 
 def simulate_self_play_games(progress_queue=None):
     training_examples = []
 
-    network = InferenceClient(_request_queue)
+    network = InferenceClient(_request_queues)
     mcts = MCTS(network = network)
 
     num_games = config['self_play']['num_of_self_play_games_per_process']

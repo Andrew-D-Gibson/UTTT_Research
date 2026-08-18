@@ -36,6 +36,13 @@ class TrainingManager:
 
         self.session_id = session_id or new_session_id()
 
+        # This process trains the candidate (model.fit()) and now shares its GPU(s) with
+        # the inference-server processes (uttt/inference/server.py), which already use
+        # growth mode - without this, TF's default "grab ~90%+ of the first GPU up front"
+        # behavior here competes with them for the same memory instead of coexisting.
+        for gpu in tf.config.experimental.list_physical_devices('GPU'):
+            tf.config.experimental.set_memory_growth(gpu, True)
+
         self.network = tf.keras.models.load_model(NETWORK_PATH)
 
         self.training_examples = self.load_latest_training_examples()
@@ -239,30 +246,47 @@ class TrainingManager:
         return request_queue, server
 
     def start_inference_servers(self, network_path):
-        # One server per configured GPU, all serving the same network - self-play
-        # workers share this single request_queue and whichever server drains a given
-        # request handles it. [] -> a single CPU-only server (gpu_id=None).
-        gpu_ids = config['inference']['gpu_ids'] or [None]
-        request_queue = self.mp_ctx.Queue()
-        servers = []
-        for gpu_id in gpu_ids:
-            server = self.mp_ctx.Process(
-                target=run_inference_server,
-                args=(network_path, request_queue, gpu_id,
-                      config['inference']['max_batch_size'],
-                      config['inference']['max_wait_ms'] / 1000.0),
-            )
-            server.start()
-            servers.append(server)
-        return request_queue, servers
+        # One queue *per distinct GPU*, not one shared queue for every server -
+        # servers assigned to the same GPU (config['inference']['gpu_ids'] repeats an
+        # id once per server process wanted on that GPU, e.g. [0, 0, 0, 1, 1, 1] for 3
+        # servers/GPU) share that GPU's queue and naturally work-steal among
+        # themselves, but each GPU needs its own queue so InferenceClient can
+        # explicitly round-robin *across* GPUs. A single queue shared by every server
+        # regardless of GPU has no fairness guarantee across concurrent consumer
+        # processes - in practice this let one GPU's servers win the race to drain it
+        # almost every time, leaving other GPUs' servers (and the GPUs themselves)
+        # comparatively idle instead of splitting load evenly.
+        # Returns a list of (queue, [server, ...]) groups, one per distinct GPU - pass
+        # [queue for queue, _ in groups] to init_self_play_worker, and the whole list
+        # to stop_inference_servers.
+        configured_gpu_ids = config['inference']['gpu_ids']
+        distinct_gpu_ids = list(dict.fromkeys(configured_gpu_ids)) or [None]
+        server_groups = []
+        for gpu_id in distinct_gpu_ids:
+            servers_on_this_gpu = configured_gpu_ids.count(gpu_id) if configured_gpu_ids else 1
+            queue = self.mp_ctx.Queue()
+            servers = []
+            for _ in range(servers_on_this_gpu):
+                server = self.mp_ctx.Process(
+                    target=run_inference_server,
+                    args=(network_path, queue, gpu_id,
+                          config['inference']['max_batch_size'],
+                          config['inference']['max_wait_ms'] / 1000.0),
+                )
+                server.start()
+                servers.append(server)
+            server_groups.append((queue, servers))
+        return server_groups
 
-    def stop_inference_servers(self, request_queue, servers):
-        # One None sentinel per server - each server exits after consuming exactly
-        # one (see run_inference_server's `if item is None: break`).
-        for _ in servers:
-            request_queue.put(None)
-        for server in servers:
-            server.join()
+    def stop_inference_servers(self, server_groups):
+        # One None sentinel per server in each group's queue - each server exits after
+        # consuming exactly one (see run_inference_server's `if item is None: break`).
+        for queue, servers in server_groups:
+            for _ in servers:
+                queue.put(None)
+        for _, servers in server_groups:
+            for server in servers:
+                server.join()
 
     def run_self_play(self):
         num_processes = config['self_play']['num_of_processes']
@@ -273,14 +297,15 @@ class TrainingManager:
         self_play_start_time = time.time()
 
         progress_queue = self.mp_manager.Queue()
-        request_queue, servers = self.start_inference_servers(NETWORK_PATH)
+        server_groups = self.start_inference_servers(NETWORK_PATH)
+        request_queues = [queue for queue, _ in server_groups]
 
-        # request_queue must go through Pool's initializer/initargs, not apply_async's
+        # request_queues must go through Pool's initializer/initargs, not apply_async's
         # per-task args - a raw multiprocessing.Queue can only be inherited at worker
         # process creation, not pickled through Pool's task-dispatch queue at call time
         # (see uttt/simulation/self_play.py's init_self_play_worker).
         pool = self.mp_ctx.Pool(num_processes, initializer=init_self_play_worker,
-                                 initargs=(request_queue,))
+                                 initargs=(request_queues,))
         async_results = [
             pool.apply_async(simulate_self_play_games, args=(progress_queue,))
             for _ in range(num_processes)
@@ -308,7 +333,7 @@ class TrainingManager:
                   f'({plies} plies, {duration:.1f}s) - elapsed {elapsed:.0f}s, ETA ~{eta:.0f}s')
 
         pool.join()
-        self.stop_inference_servers(request_queue, servers)
+        self.stop_inference_servers(server_groups)
 
         # .get() (not the old callback=) so a worker exception is re-raised here instead of
         # silently under-filling the replay buffer this episode was supposed to receive.
@@ -364,10 +389,12 @@ class TrainingManager:
             # inference servers rather than sharing one - split across the configured
             # GPUs (candidate on the first, champion on the second) so gating actually
             # keeps both GPUs busy; both fall back to the same id/CPU if only one is
-            # configured.
-            gpu_ids = config['inference']['gpu_ids'] or [None]
-            candidate_gpu = gpu_ids[0]
-            champion_gpu = gpu_ids[1] if len(gpu_ids) > 1 else gpu_ids[0]
+            # configured. Dedup (preserving order) rather than indexing gpu_ids directly -
+            # self_play.gpu_ids repeats each id once per server process on that GPU (e.g.
+            # [0, 0, 0, 1, 1, 1] for 3 servers/GPU), so gpu_ids[1] would still be 0.
+            distinct_gpu_ids = list(dict.fromkeys(config['inference']['gpu_ids'])) or [None]
+            candidate_gpu = distinct_gpu_ids[0]
+            champion_gpu = distinct_gpu_ids[1] if len(distinct_gpu_ids) > 1 else distinct_gpu_ids[0]
             candidate_queue, candidate_server = self.start_inference_server(candidate_path, candidate_gpu)
             champion_queue, champion_server = self.start_inference_server(NETWORK_PATH, champion_gpu)
 
@@ -401,8 +428,8 @@ class TrainingManager:
                       f'({outcome}, {duration:.1f}s) - elapsed {elapsed:.0f}s, ETA ~{eta:.0f}s')
 
             pool.join()
-            self.stop_inference_servers(candidate_queue, [candidate_server])
-            self.stop_inference_servers(champion_queue, [champion_server])
+            self.stop_inference_servers([(candidate_queue, [candidate_server]),
+                                          (champion_queue, [champion_server])])
 
             # .get() (not a callback) so a worker exception is re-raised here
             # instead of silently under-counting the tally that decides promotion.

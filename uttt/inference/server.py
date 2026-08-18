@@ -11,8 +11,16 @@ class InferenceClient:
     # __call__(board_arrays, training=False) interface MCTS.check_network already
     # calls (uttt/search/mcts.py), so MCTS can't tell this apart from a real model -
     # no changes are needed to MCTS's tree-walk/recursion to use this instead.
-    def __init__(self, request_queue, response_timeout=60.0):
-        self._request_queue = request_queue
+    def __init__(self, request_queues, response_timeout=60.0):
+        # One queue per distinct GPU (servers sharing a GPU share that GPU's queue -
+        # see TrainingManager.start_inference_servers). Explicitly round-robin across
+        # them here rather than relying on multiprocessing.Queue to fairly arbitrate
+        # between multiple concurrent consumer processes when several GPUs' servers
+        # all drain one shared queue - it doesn't: whichever server process happens to
+        # win the wakeup race keeps winning it, which in practice left one GPU doing
+        # most of the work and another sitting nearly idle instead of splitting evenly.
+        self._request_queues = request_queues
+        self._next_queue_index = 0
         # duplex=False: this client only ever reads, the inference server only ever
         # writes, on a given request/response leg.
         self._client_conn, self._server_conn = mp.Pipe(duplex=False)
@@ -22,7 +30,9 @@ class InferenceClient:
         # check_network always calls with a batch of exactly one board - unwrap it
         # here so callers on both ends of the queue only ever deal in single boards.
         board = board_arrays[0]
-        self._request_queue.put((board, self._server_conn))
+        request_queue = self._request_queues[self._next_queue_index]
+        self._next_queue_index = (self._next_queue_index + 1) % len(self._request_queues)
+        request_queue.put((board, self._server_conn))
 
         if not self._client_conn.poll(self._response_timeout):
             raise TimeoutError(
@@ -40,6 +50,17 @@ def run_inference_server(network_path, request_queue, gpu_id=None,
     os.environ['CUDA_VISIBLE_DEVICES'] = '-1' if gpu_id is None else str(gpu_id)
 
     import tensorflow as tf
+
+    # Must also happen before any op touches the GPU (right after listing devices, before
+    # loading the model below). Without this, the first process to touch a physical GPU
+    # pre-allocates ~90%+ of its memory for itself by default - fine with one process per
+    # GPU, but fatal once multiple inference-server processes share a GPU (gpu_id repeated
+    # in config['inference']['gpu_ids']): the first one to initialize starves the rest,
+    # which then fail (often as a confusing "RESOURCE_EXHAUSTED... cuDNN engine profiling
+    # failure" rather than an obvious allocation error). Growth mode makes each process
+    # claim memory incrementally as it actually needs it instead.
+    for gpu in tf.config.experimental.list_physical_devices('GPU'):
+        tf.config.experimental.set_memory_growth(gpu, True)
 
     network = tf.keras.models.load_model(network_path, compile=False)
 

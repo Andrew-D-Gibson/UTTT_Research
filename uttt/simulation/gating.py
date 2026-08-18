@@ -19,9 +19,11 @@ def init_gating_worker(candidate_queue, champion_queue):
 def simulate_gating_games(num_games, start_index, progress_queue=None):
     # Candidate and champion are different weights, served by two separate
     # inference-server processes (see TrainingManager.run_gating) - one InferenceClient
-    # per queue routes each side's requests to the right one.
-    candidate_network = InferenceClient(_candidate_queue)
-    champion_network = InferenceClient(_champion_queue)
+    # per queue routes each side's requests to the right one. Each is only ever one
+    # queue (gating doesn't run multiple servers per side the way self-play can), but
+    # InferenceClient always takes a list to round-robin over.
+    candidate_network = InferenceClient([_candidate_queue])
+    champion_network = InferenceClient([_champion_queue])
 
     candidate_agent = ProbabilisticNetworkMCTSAgent(candidate_network)
     champion_agent = ProbabilisticNetworkMCTSAgent(champion_network)

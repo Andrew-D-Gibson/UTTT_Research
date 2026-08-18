@@ -155,7 +155,7 @@ this stand-in:
 ```
 worker (InferenceClient)                     inference server (run_inference_server)
   __call__(board) ─┐                           owns the one loaded network for this GPU
-                    ├─ put (board, response_conn) on a shared request_queue
+                    ├─ put (board, response_conn) on this GPU's request_queue
                     └─ blocks on response_conn.recv() ──┐
                                                           ├─ drains request_queue up to
                                                           │  inference.max_batch_size boards or
@@ -167,18 +167,36 @@ worker (InferenceClient)                     inference server (run_inference_ser
 
 Batching comes from many *different* games' leaf requests landing at the server around the same
 time (purely because many worker processes are mid-search simultaneously) - MCTS's own recursive
-search (`MCTS_iteration`) is untouched, still fully synchronous per game, no virtual loss. One
-server process per `config['inference']['gpu_ids']` entry (`[]` → a single CPU-only server).
-`TrainingManager.start_inference_server(s)`/`stop_inference_servers()` own the server processes'
-lifecycle, one set per `run_self_play()`/`run_gating()` call (`run_gating` runs two - candidate and
-champion are different weights, so each needs its own server rather than sharing one).
+search (`MCTS_iteration`) is untouched, still fully synchronous per game, no virtual loss.
+`config['inference']['gpu_ids']` may repeat a GPU id to run multiple server processes sharing that
+GPU (splits the request-handling loop itself across more CPU cores, since it's single-threaded
+Python per server - see §6 for why this matters). Server processes are grouped **one request queue
+per distinct GPU**, not one queue shared by every server regardless of GPU: servers sharing a GPU
+share that GPU's queue and naturally work-steal among themselves, but `InferenceClient` explicitly
+round-robins its requests *across* the distinct-GPU queues (`TrainingManager.start_inference_servers`
+returns one `(queue, [server, ...])` group per distinct GPU). This is deliberate, not incidental -
+relying on `multiprocessing.Queue` to fairly arbitrate between several GPUs' worth of servers all
+draining one shared queue does not work in practice: whichever server process wins the wakeup race
+tends to keep winning it, so one GPU ends up doing most of the work while another sits comparatively
+idle, rather than splitting evenly. `TrainingManager.start_inference_server(s)`/`stop_inference_servers()`
+own the server processes' lifecycle, one set per `run_self_play()`/`run_gating()` call (`run_gating`
+runs two single-server groups - candidate and champion are different weights, so each needs its own
+server rather than sharing one; unlike self-play it doesn't currently support multiple servers per
+side).
 
-The request queue is passed to `Pool` workers via `initializer`/`initargs`
+Each GPU's queue is passed to `Pool` workers via `initializer`/`initargs`
 (`init_self_play_worker`/`init_gating_worker`), not as a normal `apply_async` argument - a raw
 `multiprocessing.Queue` can only be inherited by a worker at process-creation time; pickling one
 through `Pool`'s per-task dispatch queue raises `RuntimeError: Queue objects should only be shared
 between processes through inheritance`. This is the same reason `uttt/simulation/tournament.py`
 already builds its agents via a `Pool(initializer=...)` rather than per-call arguments.
+
+Both the inference-server processes and the main `TrainingManager` process (which shares GPUs with
+them once it also trains on one - `model.fit()` in `train_on_examples()`) explicitly enable
+`tf.config.experimental.set_memory_growth()` on every visible GPU before touching it. Without this,
+TF's default behavior is to pre-allocate ~90%+ of a GPU's memory to the *first* process that touches
+it - harmless with one TF process per GPU, but starves every other process sharing that GPU once
+`gpu_ids` repeats an id or the main process's training shares a GPU with an inference server.
 
 ## 5. Config knobs (`uttt/config.py`)
 

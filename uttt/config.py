@@ -17,9 +17,17 @@ config = {
     },
 
     'inference': {
-        'gpu_ids': [],          # e.g. [0, 1] for a 2-GPU box - one inference server process
-                                 # per id, all self-play workers share them. [] -> a single
-                                 # CPU-only inference server (safe default, matches old behavior).
+        # One inference server process per entry - repeat a GPU id to run multiple server
+        # processes sharing that GPU, e.g. [0, 0, 0, 0, 1, 1, 1, 1] for 4 servers per GPU on
+        # a 2-GPU box. This matters because each server's request/response dispatch loop
+        # (multiprocessing.Queue.get + Pipe.send, one round trip per leaf evaluation) is
+        # single-threaded Python and has real per-message overhead - at high worker counts
+        # that loop saturates well before the GPU does (symptom: GPU usage stays low while
+        # adding self_play.num_of_processes makes games *slower*, since workers are now
+        # queueing for a saturated server rather than being throughput-limited by it).
+        # Splitting the same GPU across multiple server processes parallelizes that dispatch
+        # loop across more CPU cores instead of one. [] -> a single CPU-only server.
+        'gpu_ids': [],
         'max_batch_size': 64,   # cap on boards per network() call in the inference server
         'max_wait_ms': 5,       # longest a server waits to fill a batch before flushing partial
     },

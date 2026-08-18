@@ -46,21 +46,25 @@ class InferenceClient:
 
 def run_inference_server(network_path, request_queue, gpu_id=None,
                           max_batch_size=64, max_wait_s=0.005):
-    # Must happen before TensorFlow is imported/initialized in this process.
+    # Must happen before TensorFlow is imported/initialized in this process - including
+    # transitively, which is why uttt.worker (imports tensorflow at module level) is
+    # imported here, locally, rather than at this module's top level: uttt.inference.server
+    # is also imported by self-play/gating *worker* processes (for InferenceClient), which
+    # must never import TensorFlow at all, and a top-level import here would do so before
+    # this line even runs.
     os.environ['CUDA_VISIBLE_DEVICES'] = '-1' if gpu_id is None else str(gpu_id)
 
+    from uttt.worker import enable_gpu_memory_growth
     import tensorflow as tf
 
-    # Must also happen before any op touches the GPU (right after listing devices, before
-    # loading the model below). Without this, the first process to touch a physical GPU
-    # pre-allocates ~90%+ of its memory for itself by default - fine with one process per
-    # GPU, but fatal once multiple inference-server processes share a GPU (gpu_id repeated
-    # in config['inference']['gpu_ids']): the first one to initialize starves the rest,
-    # which then fail (often as a confusing "RESOURCE_EXHAUSTED... cuDNN engine profiling
-    # failure" rather than an obvious allocation error). Growth mode makes each process
-    # claim memory incrementally as it actually needs it instead.
-    for gpu in tf.config.experimental.list_physical_devices('GPU'):
-        tf.config.experimental.set_memory_growth(gpu, True)
+    # Must also happen before any op touches the GPU (before loading the model below).
+    # Without this, the first process to touch a physical GPU pre-allocates ~90%+ of its
+    # memory for itself by default - fine with one process per GPU, but fatal once
+    # multiple inference-server processes share a GPU (gpu_id repeated in
+    # config['inference']['gpu_ids']): the first one to initialize starves the rest, which
+    # then fail (often as a confusing "RESOURCE_EXHAUSTED... cuDNN engine profiling
+    # failure" rather than an obvious allocation error).
+    enable_gpu_memory_growth()
 
     network = tf.keras.models.load_model(network_path, compile=False)
 

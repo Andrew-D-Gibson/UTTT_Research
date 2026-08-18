@@ -15,6 +15,7 @@ from uttt.board.symmetry import apply_board_symmetry, apply_move_vector_symmetry
 from uttt.simulation.self_play import simulate_self_play_games, init_self_play_worker
 from uttt.simulation.gating import simulate_gating_games, init_gating_worker
 from uttt.inference.server import run_inference_server
+from uttt.worker import enable_gpu_memory_growth
 
 from uttt.config import config
 from uttt.paths import (
@@ -36,12 +37,14 @@ class TrainingManager:
 
         self.session_id = session_id or new_session_id()
 
-        # This process trains the candidate (model.fit()) and now shares its GPU(s) with
-        # the inference-server processes (uttt/inference/server.py), which already use
-        # growth mode - without this, TF's default "grab ~90%+ of the first GPU up front"
+        # This process trains the candidate (model.fit()) and shares its GPU(s) with the
+        # inference-server processes (uttt/inference/server.py), which also use growth
+        # mode - without this, TF's default "grab ~90%+ of the first GPU up front"
         # behavior here competes with them for the same memory instead of coexisting.
-        for gpu in tf.config.experimental.list_physical_devices('GPU'):
-            tf.config.experimental.set_memory_growth(gpu, True)
+        # A no-op if project.py's own earlier call already covered it (idempotent as
+        # long as no GPU has been used yet) - kept here too since TrainingManager can be
+        # constructed directly without going through project.py.
+        enable_gpu_memory_growth()
 
         self.network = tf.keras.models.load_model(NETWORK_PATH)
 

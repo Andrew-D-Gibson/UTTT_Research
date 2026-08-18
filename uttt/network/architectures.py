@@ -54,7 +54,7 @@ def convNet():
 # based on. Kept modest in scale (not AlphaZero-sized) per the design brief.
 NUM_CHANNELS = 4
 META_FILTERS = 128
-NUM_RES_BLOCKS = 3
+NUM_RES_BLOCKS = 4
 L2_WEIGHT = 1e-4
 
 POLICY_META_BRANCH_FILTERS = 32     # channels after reducing meta_features for broadcast

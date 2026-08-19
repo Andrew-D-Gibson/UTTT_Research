@@ -15,3 +15,4 @@ Thumbs.db
 # always deletes them afterward, but ignore them in case a run gets killed mid-gating).
 data/Networks/_candidate_tmp.keras
 data/Networks/_gating_candidate.keras
+data/

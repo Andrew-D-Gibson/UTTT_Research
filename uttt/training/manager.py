@@ -235,24 +235,37 @@ class TrainingManager:
               f"buffer_cap={config['training']['max_training_examples']}")
         print(f"  episodes:  {config['training']['num_of_episodes']}")
 
-    def start_inference_server(self, network_path, gpu_id):
-        # One request queue + one dedicated process owning one loaded copy of
-        # `network_path`, pinned to `gpu_id` (uttt/inference/server.py). Plain
-        # mp_ctx.Queue(), not self.mp_manager.Queue() - this queue is on the hot path
-        # (hit once per MCTS leaf, ~512 times per move per worker), and routing that
-        # through the SyncManager's proxy process (as progress_queue does, fine for
-        # its much lower message rate) would add a lot of avoidable overhead. Plain
-        # Queue also reliably carries the Connection objects InferenceClient passes
-        # through it, which a Manager-proxied queue isn't guaranteed to preserve.
+    def start_inference_server(self, network_path, gpu_id, num_servers=1):
+        # One request queue + `num_servers` dedicated processes, all sharing that
+        # queue and all serving `network_path`, pinned to `gpu_id`
+        # (uttt/inference/server.py). Plain mp_ctx.Queue(), not self.mp_manager.Queue()
+        # - this queue is on the hot path (hit once per MCTS leaf, ~256 times per move
+        # per worker), and routing that through the SyncManager's proxy process (as
+        # progress_queue does, fine for its much lower message rate) would add a lot
+        # of avoidable overhead. Plain Queue also reliably carries the Connection
+        # objects InferenceClient passes through it, which a Manager-proxied queue
+        # isn't guaranteed to preserve.
+        #
+        # num_servers matters a lot: gating pins one whole network to one GPU and still
+        # has the full self_play.num_of_processes worker count hammering it (unlike
+        # self-play, which spreads that same worker count across every entry in
+        # config['inference']['gpu_ids'] - see start_inference_servers). A single
+        # server process per side can't keep up - each MCTS move is up to
+        # search_depth sequential, blocking leaf evaluations, so one under-provisioned
+        # queue turns "slow" into "no gating game finishes within stall_timeout_s at
+        # all", which looks identical to a dead worker to _drain_progress_queue.
         request_queue = self.mp_ctx.Queue()
-        server = self.mp_ctx.Process(
-            target=run_inference_server,
-            args=(network_path, request_queue, gpu_id,
-                  config['inference']['max_batch_size'],
-                  config['inference']['max_wait_ms'] / 1000.0),
-        )
-        server.start()
-        return request_queue, server
+        servers = []
+        for _ in range(num_servers):
+            server = self.mp_ctx.Process(
+                target=run_inference_server,
+                args=(network_path, request_queue, gpu_id,
+                      config['inference']['max_batch_size'],
+                      config['inference']['max_wait_ms'] / 1000.0),
+            )
+            server.start()
+            servers.append(server)
+        return request_queue, servers
 
     def start_inference_servers(self, network_path):
         # One queue *per distinct GPU*, not one shared queue for every server -
@@ -449,9 +462,21 @@ class TrainingManager:
             # configured. Dedup (preserving order) rather than indexing gpu_ids directly -
             # self_play.gpu_ids repeats each id once per server process on that GPU (e.g.
             # [0, 0, 0, 1, 1, 1] for 3 servers/GPU), so gpu_ids[1] would still be 0.
-            distinct_gpu_ids = list(dict.fromkeys(config['inference']['gpu_ids'])) or [None]
+            configured_gpu_ids = config['inference']['gpu_ids']
+            distinct_gpu_ids = list(dict.fromkeys(configured_gpu_ids)) or [None]
             candidate_gpu = distinct_gpu_ids[0]
             champion_gpu = distinct_gpu_ids[1] if len(distinct_gpu_ids) > 1 else distinct_gpu_ids[0]
+
+            # One server process per side isn't enough: gating still has the same
+            # self_play.num_of_processes workers hammering it that self-play spreads
+            # across every entry in gpu_ids (12 processes at today's defaults), so a
+            # lone candidate/champion server becomes a severe bottleneck - games take
+            # far longer than stall_timeout_s, which _drain_progress_queue can't tell
+            # apart from a dead worker. Match self-play's per-GPU process count instead
+            # (how many gpu_ids entries landed on that GPU); .count(None) still works
+            # when gpu_ids is empty since distinct_gpu_ids falls back to [None] above.
+            candidate_num_servers = configured_gpu_ids.count(candidate_gpu) or 1
+            champion_num_servers = configured_gpu_ids.count(champion_gpu) or 1
 
             attempt = 0
             while True:
@@ -459,10 +484,12 @@ class TrainingManager:
                 gating_start_time = time.time()
                 progress_queue = self.mp_manager.Queue()
 
-                candidate_queue, candidate_server = self.start_inference_server(candidate_path, candidate_gpu)
-                champion_queue, champion_server = self.start_inference_server(NETWORK_PATH, champion_gpu)
-                server_groups = [(candidate_queue, [candidate_server]),
-                                  (champion_queue, [champion_server])]
+                candidate_queue, candidate_servers = self.start_inference_server(
+                    candidate_path, candidate_gpu, candidate_num_servers)
+                champion_queue, champion_servers = self.start_inference_server(
+                    NETWORK_PATH, champion_gpu, champion_num_servers)
+                server_groups = [(candidate_queue, candidate_servers),
+                                  (champion_queue, champion_servers)]
 
                 pool = self.mp_ctx.Pool(len(chunk_sizes), initializer=init_gating_worker,
                                          initargs=(candidate_queue, champion_queue))

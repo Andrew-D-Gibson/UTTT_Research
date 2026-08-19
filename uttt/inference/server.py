@@ -44,6 +44,17 @@ class InferenceClient:
         return {'policy_output': policy, 'value_output': value}
 
 
+# Raised when the process on the other end of a Pipe/Queue has already died -
+# e.g. a self-play worker killed mid-request. Left uncontained, any one of these
+# used to crash the entire inference server process, which took every *other*
+# worker sharing this GPU's queue down with it too (they'd eventually hit
+# InferenceClient's 60s response timeout and die themselves). Caught narrowly
+# below (not a bare except) so a real bug elsewhere - a bad board, a network()
+# failure - still fails loud instead of being silently swallowed.
+_DEAD_PEER_ERRORS = (BrokenPipeError, EOFError, ConnectionResetError,
+                      ConnectionRefusedError, FileNotFoundError)
+
+
 def run_inference_server(network_path, request_queue, gpu_id=None,
                           max_batch_size=64, max_wait_s=0.005):
     # Must happen before TensorFlow is imported/initialized in this process - including
@@ -71,9 +82,19 @@ def run_inference_server(network_path, request_queue, gpu_id=None,
     log_prefix = f'[inference server pid={os.getpid()} gpu={gpu_id}]'
     total_requests = 0
     total_batches = 0
+    dropped_requests = 0
 
     while True:
-        item = request_queue.get()
+        try:
+            item = request_queue.get()
+        except _DEAD_PEER_ERRORS as e:
+            # The client that queued this request is already gone (its fd handoff
+            # never completed) - the malformed item is already off the queue by
+            # the time unpickling raised, so just move on to the next one.
+            print(f'{log_prefix} dropped an orphaned request ({e!r}) - continuing', flush=True)
+            dropped_requests += 1
+            continue
+
         if item is None:
             break
 
@@ -94,6 +115,10 @@ def run_inference_server(network_path, request_queue, gpu_id=None,
                 item = request_queue.get(timeout=remaining)
             except queue.Empty:
                 break
+            except _DEAD_PEER_ERRORS as e:
+                print(f'{log_prefix} dropped an orphaned request ({e!r}) - continuing', flush=True)
+                dropped_requests += 1
+                continue
 
             if item is None:
                 stop_after_batch = True
@@ -108,7 +133,14 @@ def run_inference_server(network_path, request_queue, gpu_id=None,
         values = np.asarray(outputs['value_output'])
 
         for i, conn in enumerate(batch_conns):
-            conn.send((policies[i:i + 1], values[i:i + 1]))
+            try:
+                conn.send((policies[i:i + 1], values[i:i + 1]))
+            except _DEAD_PEER_ERRORS as e:
+                # That one requester died between submitting and us responding -
+                # drop its result and keep serving the rest of the batch instead
+                # of taking the whole server down with it.
+                print(f'{log_prefix} could not deliver a result to a dead client ({e!r}) - dropping it', flush=True)
+                dropped_requests += 1
 
         total_requests += len(batch_boards)
         total_batches += 1
@@ -118,4 +150,4 @@ def run_inference_server(network_path, request_queue, gpu_id=None,
 
     avg_batch = total_requests / total_batches if total_batches else 0
     print(f'{log_prefix} done - {total_requests} requests in {total_batches} batches '
-          f'(avg batch size {avg_batch:.1f})', flush=True)
+          f'(avg batch size {avg_batch:.1f}, {dropped_requests} dropped)', flush=True)

@@ -30,6 +30,12 @@ from uttt.paths import (
 )
 from uttt.run_logging import snapshot_config, new_session_id
 
+
+class WorkerPoolStalledError(RuntimeError):
+    """Raised by TrainingManager._drain_progress_queue when a self-play/gating
+    worker pool goes silent for longer than config['self_play']['stall_timeout_s']."""
+
+
 class TrainingManager:
     def __init__(self, session_id=None):
         ensure_data_dirs()
@@ -291,70 +297,121 @@ class TrainingManager:
             for server in servers:
                 server.join()
 
+    def _drain_progress_queue(self, progress_queue, total_units, async_results, on_message):
+        # Bounded-wait drain: an unconditional blocking queue.get() would hang the run
+        # forever, with no error and no log output, if a worker died before delivering its
+        # full quota of progress messages. The stall_timeout_s check on top of that catches
+        # the specific case an empty-queue/all-ready check alone can't: a worker whose OS
+        # process died mid-task, since multiprocessing.Pool spawns a replacement worker for
+        # future tasks but never resolves the AsyncResult that was in flight on the dead one
+        # - nothing else distinguishes "still working" from "gone forever" in that case.
+        stall_timeout = config['self_play']['stall_timeout_s']
+        units_done = 0
+        last_progress_time = time.time()
+
+        while units_done < total_units:
+            try:
+                msg = progress_queue.get(timeout=5)
+            except queue.Empty:
+                if all(r.ready() for r in async_results):
+                    break
+                if time.time() - last_progress_time > stall_timeout:
+                    raise WorkerPoolStalledError(
+                        f'No progress from the worker pool in over {stall_timeout}s '
+                        f'({units_done}/{total_units} done) - a worker likely died silently.'
+                    )
+                continue
+
+            last_progress_time = time.time()
+            units_done += 1
+            on_message(msg, units_done)
+
+        return units_done
+
+    def _force_teardown(self, pool, server_groups):
+        # Used only after a stall - pool.join() and the sentinel-based
+        # stop_inference_servers() both assume every worker/server is still alive and
+        # responsive enough to voluntarily exit, which is exactly what a stall means we
+        # can no longer assume. terminate() sends SIGTERM directly instead of waiting.
+        pool.terminate()
+        pool.join()
+        for _, servers in server_groups:
+            for server in servers:
+                server.terminate()
+            for server in servers:
+                server.join()
+
     def run_self_play(self):
         num_processes = config['self_play']['num_of_processes']
         games_per_process = config['self_play']['num_of_self_play_games_per_process']
         total_games = num_processes * games_per_process
+        max_retries = config['self_play']['max_stall_retries']
 
         print(f'--- Self-play: {total_games} games ({num_processes} processes x {games_per_process}/process) ---')
-        self_play_start_time = time.time()
 
-        progress_queue = self.mp_manager.Queue()
-        server_groups = self.start_inference_servers(NETWORK_PATH)
-        request_queues = [queue for queue, _ in server_groups]
+        attempt = 0
+        while True:
+            attempt += 1
+            self_play_start_time = time.time()
 
-        # request_queues must go through Pool's initializer/initargs, not apply_async's
-        # per-task args - a raw multiprocessing.Queue can only be inherited at worker
-        # process creation, not pickled through Pool's task-dispatch queue at call time
-        # (see uttt/simulation/self_play.py's init_self_play_worker).
-        pool = self.mp_ctx.Pool(num_processes, initializer=init_self_play_worker,
-                                 initargs=(request_queues,))
-        async_results = [
-            pool.apply_async(simulate_self_play_games, args=(progress_queue,))
-            for _ in range(num_processes)
-        ]
-        pool.close()
+            progress_queue = self.mp_manager.Queue()
+            server_groups = self.start_inference_servers(NETWORK_PATH)
+            request_queues = [queue for queue, _ in server_groups]
 
-        # Bounded-wait drain, mirroring run_gating(): an unconditional blocking queue.get()
-        # would hang the run forever, with no error and no log output, if a worker died
-        # before delivering its full quota of progress messages.
-        games_done = 0
-        total_plies = 0
-        while games_done < total_games:
+            # request_queues must go through Pool's initializer/initargs, not apply_async's
+            # per-task args - a raw multiprocessing.Queue can only be inherited at worker
+            # process creation, not pickled through Pool's task-dispatch queue at call time
+            # (see uttt/simulation/self_play.py's init_self_play_worker).
+            pool = self.mp_ctx.Pool(num_processes, initializer=init_self_play_worker,
+                                     initargs=(request_queues,))
+            async_results = [
+                pool.apply_async(simulate_self_play_games, args=(progress_queue,))
+                for _ in range(num_processes)
+            ]
+            pool.close()
+
+            total_plies = 0
+
+            def on_message(msg, games_done_so_far):
+                nonlocal total_plies
+                pid, game_idx, worker_num_games, plies, duration = msg
+                total_plies += plies
+                elapsed = time.time() - self_play_start_time
+                eta = (elapsed / games_done_so_far) * (total_games - games_done_so_far)
+                print(f'  [{games_done_so_far}/{total_games}] worker {pid}: game {game_idx}/{worker_num_games} '
+                      f'({plies} plies, {duration:.1f}s) - elapsed {elapsed:.0f}s, ETA ~{eta:.0f}s')
+
             try:
-                pid, game_idx, worker_num_games, plies, duration = progress_queue.get(timeout=5)
-            except queue.Empty:
-                if all(r.ready() for r in async_results):
-                    break
+                self._drain_progress_queue(progress_queue, total_games, async_results, on_message)
+            except WorkerPoolStalledError as e:
+                print(f'{e} Tearing down this attempt\'s pool and inference servers '
+                      f'and retrying (attempt {attempt}/{max_retries + 1}).')
+                self._force_teardown(pool, server_groups)
+                if attempt > max_retries:
+                    raise
                 continue
 
-            games_done += 1
-            total_plies += plies
-            elapsed = time.time() - self_play_start_time
-            eta = (elapsed / games_done) * (total_games - games_done)
-            print(f'  [{games_done}/{total_games}] worker {pid}: game {game_idx}/{worker_num_games} '
-                  f'({plies} plies, {duration:.1f}s) - elapsed {elapsed:.0f}s, ETA ~{eta:.0f}s')
+            pool.join()
+            self.stop_inference_servers(server_groups)
 
-        pool.join()
-        self.stop_inference_servers(server_groups)
+            # .get() (not the old callback=) so a worker exception is re-raised here instead of
+            # silently under-filling the replay buffer this episode was supposed to receive.
+            new_examples = []
+            for r in async_results:
+                new_examples.extend(r.get())
+            self.training_examples.extend(new_examples)
 
-        # .get() (not the old callback=) so a worker exception is re-raised here instead of
-        # silently under-filling the replay buffer this episode was supposed to receive.
-        new_examples = []
-        for r in async_results:
-            new_examples.extend(r.get())
-        self.training_examples.extend(new_examples)
+            self_play_elapsed = time.time() - self_play_start_time
+            print(f'Self-play done in {self_play_elapsed:.1f}s '
+                  f'({self_play_elapsed/total_games:.1f}s/game avg, {total_plies/total_games:.1f} plies/game avg)')
+            print(f'Replay buffer: {len(self.training_examples)} examples')
 
-        self_play_elapsed = time.time() - self_play_start_time
-        print(f'Self-play done in {self_play_elapsed:.1f}s '
-              f'({self_play_elapsed/total_games:.1f}s/game avg, {total_plies/total_games:.1f} plies/game avg)')
-        print(f'Replay buffer: {len(self.training_examples)} examples')
-
-        return self_play_elapsed, total_games, total_plies, new_examples
+            return self_play_elapsed, total_games, total_plies, new_examples
 
     def run_gating(self, candidate):
         num_processes = config['self_play']['num_of_processes']
         total_games = config['self_play']['num_of_testing_games']
+        max_retries = config['self_play']['max_stall_retries']
 
         # Balanced per-worker chunk sizes, skipping any that would land on zero
         # games (e.g. total_games < num_processes at today's defaults) so we don't
@@ -384,9 +441,6 @@ class TrainingManager:
         try:
             print(f'--- Gating: {total_games} games ({len(chunk_sizes)} processes) - '
                   f'candidate vs champion ---')
-            gating_start_time = time.time()
-
-            progress_queue = self.mp_manager.Queue()
 
             # Candidate and champion are different weights, so they need two separate
             # inference servers rather than sharing one - split across the configured
@@ -398,53 +452,57 @@ class TrainingManager:
             distinct_gpu_ids = list(dict.fromkeys(config['inference']['gpu_ids'])) or [None]
             candidate_gpu = distinct_gpu_ids[0]
             champion_gpu = distinct_gpu_ids[1] if len(distinct_gpu_ids) > 1 else distinct_gpu_ids[0]
-            candidate_queue, candidate_server = self.start_inference_server(candidate_path, candidate_gpu)
-            champion_queue, champion_server = self.start_inference_server(NETWORK_PATH, champion_gpu)
 
-            pool = self.mp_ctx.Pool(len(chunk_sizes), initializer=init_gating_worker,
-                                     initargs=(candidate_queue, champion_queue))
-            async_results = [
-                pool.apply_async(simulate_gating_games, args=(size, start_index, progress_queue))
-                for size, start_index in zip(chunk_sizes, start_indices)
-            ]
-            pool.close()
+            attempt = 0
+            while True:
+                attempt += 1
+                gating_start_time = time.time()
+                progress_queue = self.mp_manager.Queue()
 
-            # Bounded-wait drain instead of an unconditional blocking queue.get():
-            # if a worker dies before delivering its full quota of progress
-            # messages, an unconditional get() would hang the run forever right at
-            # the point that decides promotion. Once every worker has finished (or
-            # errored) and the queue is still short, fall through to the .get()
-            # calls below, which will raise the real exception.
-            games_done = 0
-            while games_done < total_games:
+                candidate_queue, candidate_server = self.start_inference_server(candidate_path, candidate_gpu)
+                champion_queue, champion_server = self.start_inference_server(NETWORK_PATH, champion_gpu)
+                server_groups = [(candidate_queue, [candidate_server]),
+                                  (champion_queue, [champion_server])]
+
+                pool = self.mp_ctx.Pool(len(chunk_sizes), initializer=init_gating_worker,
+                                         initargs=(candidate_queue, champion_queue))
+                async_results = [
+                    pool.apply_async(simulate_gating_games, args=(size, start_index, progress_queue))
+                    for size, start_index in zip(chunk_sizes, start_indices)
+                ]
+                pool.close()
+
+                def on_message(msg, games_done_so_far):
+                    pid, game_idx, worker_num_games, outcome, duration = msg
+                    elapsed = time.time() - gating_start_time
+                    eta = (elapsed / games_done_so_far) * (total_games - games_done_so_far)
+                    print(f'  [{games_done_so_far}/{total_games}] worker {pid}: game {game_idx}/{worker_num_games} '
+                          f'({outcome}, {duration:.1f}s) - elapsed {elapsed:.0f}s, ETA ~{eta:.0f}s')
+
                 try:
-                    pid, game_idx, worker_num_games, outcome, duration = progress_queue.get(timeout=5)
-                except queue.Empty:
-                    if all(r.ready() for r in async_results):
-                        break
+                    self._drain_progress_queue(progress_queue, total_games, async_results, on_message)
+                except WorkerPoolStalledError as e:
+                    print(f'{e} Tearing down this attempt\'s pool and inference servers '
+                          f'and retrying (attempt {attempt}/{max_retries + 1}).')
+                    self._force_teardown(pool, server_groups)
+                    if attempt > max_retries:
+                        raise
                     continue
 
-                games_done += 1
-                elapsed = time.time() - gating_start_time
-                eta = (elapsed / games_done) * (total_games - games_done)
-                print(f'  [{games_done}/{total_games}] worker {pid}: game {game_idx}/{worker_num_games} '
-                      f'({outcome}, {duration:.1f}s) - elapsed {elapsed:.0f}s, ETA ~{eta:.0f}s')
+                pool.join()
+                self.stop_inference_servers(server_groups)
 
-            pool.join()
-            self.stop_inference_servers([(candidate_queue, [candidate_server]),
-                                          (champion_queue, [champion_server])])
+                # .get() (not a callback) so a worker exception is re-raised here
+                # instead of silently under-counting the tally that decides promotion.
+                totals = [r.get() for r in async_results]
+                candidate_wins = sum(t[0] for t in totals)
+                draws = sum(t[1] for t in totals)
+                champion_wins = sum(t[2] for t in totals)
 
-            # .get() (not a callback) so a worker exception is re-raised here
-            # instead of silently under-counting the tally that decides promotion.
-            totals = [r.get() for r in async_results]
-            candidate_wins = sum(t[0] for t in totals)
-            draws = sum(t[1] for t in totals)
-            champion_wins = sum(t[2] for t in totals)
+                gating_elapsed = time.time() - gating_start_time
+                print(f'Gating done in {gating_elapsed:.1f}s ({gating_elapsed/total_games:.1f}s/game avg)')
 
-            gating_elapsed = time.time() - gating_start_time
-            print(f'Gating done in {gating_elapsed:.1f}s ({gating_elapsed/total_games:.1f}s/game avg)')
-
-            return candidate_wins, draws, champion_wins, gating_elapsed
+                return candidate_wins, draws, champion_wins, gating_elapsed
         finally:
             if os.path.exists(candidate_path):
                 os.remove(candidate_path)

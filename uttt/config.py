@@ -42,6 +42,19 @@ config = {
         'num_of_testing_games': 60,       # 240? candidate vs. champion gating match total, parallelized across num_of_processes
         'promotion_win_rate': 0.55,       # candidate must win >= this share of decisive (non-drawn) gating games to be promoted
         'temperature_moves': 20,       # sample proportional to visit counts for this many plies, then play greedy
+
+        # If the self-play/gating worker pool produces no progress message at all for this
+        # long, TrainingManager assumes a worker died silently (multiprocessing.Pool never
+        # resolves the AsyncResult for a task whose worker process died mid-task, so nothing
+        # else can tell "still working" apart from "gone forever") and forces a clean
+        # restart of that phase rather than hang indefinitely. Keep this comfortably above
+        # the slowest single game you've actually observed - self-play games have taken
+        # 30-40+ minutes on constrained/oversubscribed hardware, and since progress is only
+        # reported per finished game, it's normal for zero messages to arrive for up to
+        # about one game's worth of time right after a phase starts (every worker begins
+        # its first game at once).
+        'stall_timeout_s': 3600,
+        'max_stall_retries': 2,       # give up and raise for real after this many consecutive stalls in one phase, rather than retrying forever if the cause is systemic
     },
 
     'training': {

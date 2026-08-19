@@ -1,5 +1,6 @@
 import os
 import time
+import traceback
 import numpy as np
 
 from uttt.search.mcts import MCTS
@@ -27,6 +28,22 @@ def init_self_play_worker(request_queues):
 
 
 def simulate_self_play_games(progress_queue=None):
+    # apply_async already re-raises whatever this worker raises when
+    # run_self_play() calls r.get() (see TrainingManager.run_self_play) - but by
+    # then it's one exception among however many other workers may also have
+    # failed, and any inference-server crashes this worker's death triggered
+    # have usually already buried it in noise. Printing the full traceback here,
+    # from the worker itself, at the moment of failure, is what actually
+    # identifies which worker died from what.
+    try:
+        return _simulate_self_play_games(progress_queue)
+    except Exception:
+        print(f'[worker {os.getpid()}] crashed:', flush=True)
+        traceback.print_exc()
+        raise
+
+
+def _simulate_self_play_games(progress_queue):
     training_examples = []
 
     network = InferenceClient(_request_queues)
